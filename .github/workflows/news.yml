@@ -1,0 +1,39 @@
+name: TW/US Tech News Digest
+
+on:
+  schedule:
+    - cron: "30 23 * * *"   # 07:30 Asia/Taipei (UTC+8)
+    - cron: "0 6 * * *"     # 14:00 Asia/Taipei (UTC+8)
+  workflow_dispatch:         # 允許在GitHub網頁上手動觸發測試
+
+jobs:
+  send-digest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install -r requirements.txt
+
+      - name: Determine which report to run
+        id: which
+        run: |
+          hour_utc=$(date -u +%H)
+          if [ "$hour_utc" = "23" ]; then
+            echo "report=morning" >> "$GITHUB_OUTPUT"
+          else
+            echo "report=afternoon" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run digest (manual trigger defaults to morning)
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          report="${{ steps.which.outputs.report }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            report="morning"
+          fi
+          python discord_news_bot.py --report "$report"
