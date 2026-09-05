@@ -37,7 +37,14 @@ CNYES_URL = "https://api.cnyes.com/media/api/v1/newslist/category/tw_stock_news"
 UDN_SEARCH_URL = "https://udn.com/api/more"
 TWSE_COMPANY_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L"   # 上市公司名單(免key)
 TPEX_COMPANY_URL = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O"  # 上櫃公司名單(免key)
+MOPS_MATERIAL_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap04_L"  # 上市公司每日重大訊息(官方強制揭露)
 TW_TIMEZONE = timezone(timedelta(hours=8))
+
+# MOPS重大訊息的「主旨」裡,含這些字樣的算行政程序性公告,不是真正有意義的個股新聞,排除
+MOPS_ROUTINE_PATTERNS = [
+    "更名", "法人說明會", "股票面額", "變更登記", "召開股東", "股東會",
+    "補辦", "更正公告", "取得或處分", "背書保證餘額", "資金貸與餘額",
+]
 
 # 熱門新題材偵測用:太generic的關鍵字濾掉,不然每天都是這幾個字洗版
 KEYWORD_STOPWORDS = {
@@ -123,6 +130,44 @@ def match_watchlist_tw_news(articles):
         for code in matched:
             if len(per_stock[code]) < MAX_ITEMS_PER_TICKER:
                 per_stock[code].append({"title": title, "publisher": "鉅亨網", "ts": n.get("publishAt", 0)})
+    return per_stock
+
+
+def _parse_roc_datetime(date_str, time_str):
+    """民國年日期(YYYMMDD)+時間(H...HMMSS,可能缺前導0)轉成有時區的datetime。"""
+    date_str = (date_str or "").strip()
+    time_str = (time_str or "0").strip().zfill(6)
+    if len(date_str) < 7:
+        return None
+    year = int(date_str[:-4]) + 1911
+    month, day = int(date_str[-4:-2]), int(date_str[-2:])
+    hour, minute, sec = int(time_str[:-4] or 0), int(time_str[-4:-2]), int(time_str[-2:])
+    return datetime(year, month, day, hour, minute, sec, tzinfo=TW_TIMEZONE)
+
+
+def fetch_mops_material_news(since_ts):
+    """上市公司每日重大訊息(官方強制揭露,MOPS),只比對固定watchlist,當作『官方認證版』新聞。
+    排除掉行政程序性公告(更名、股東會通知等),只留真正跟營運/財務相關的重大訊息。"""
+    try:
+        r = requests.get(MOPS_MATERIAL_URL, headers={"Accept": "application/json"}, timeout=20)
+        r.raise_for_status()
+        rows = r.json()
+    except Exception as e:
+        print(f"  MOPS material fetch failed: {e}")
+        return {}
+
+    per_stock = {}
+    for row in rows:
+        code = row.get("公司代號", "")
+        if code not in TW_STOCK_CODES:
+            continue
+        subject = (row.get("主旨 ") or row.get("主旨") or "").replace("\r", "").replace("\n", " ").strip()
+        if any(p in subject for p in MOPS_ROUTINE_PATTERNS):
+            continue
+        dt = _parse_roc_datetime(row.get("發言日期"), row.get("發言時間"))
+        if dt is None or int(dt.timestamp()) < since_ts:
+            continue
+        per_stock.setdefault(code, []).append({"title": subject, "publisher": "MOPS官方公告", "ts": int(dt.timestamp())})
     return per_stock
 
 
@@ -280,6 +325,12 @@ def build_digest(report_type):
             seen_titles.add(key)
             tw_lines.append(f"• **{name} {code}**：{item['title']}")
 
+    mops_news = fetch_mops_material_news(since_ts)
+    mops_lines = []
+    for code, name in TW_STOCK_CODES.items():
+        for item in mops_news.get(code, [])[:MAX_ITEMS_PER_TICKER]:
+            mops_lines.append(f"• **{name} {code}**：{item['title']}")
+
     name_lookup = fetch_company_name_lookup()
     trending_lines = detect_trending_stocks(cnyes_articles, name_lookup)
     trending_keywords = detect_trending_keywords(cnyes_articles)
@@ -305,6 +356,10 @@ def build_digest(report_type):
         parts.append("🇺🇸 **美股科技股**")
         parts.extend(us_lines)
         parts.append("")
+    if mops_lines:
+        parts.append("📋 **官方重大訊息(MOPS強制揭露,跟媒體報導交叉對照)**")
+        parts.extend(mops_lines[:6])
+        parts.append("")
     if trending_lines:
         parts.append("🔥 **新興熱門股(不在固定清單,短時間內新聞暴增)**")
         parts.extend(trending_lines)
@@ -312,7 +367,7 @@ def build_digest(report_type):
     if trending_keywords:
         kw_str = "、".join(f"{kw}({c}則)" for kw, c in trending_keywords)
         parts.append(f"💡 **今日熱門題材關鍵字**：{kw_str}")
-    if not tw_lines and not us_lines and not trending_lines:
+    if not tw_lines and not us_lines and not mops_lines and not trending_lines:
         parts.append("（這個時段沒有偵測到符合條件的重大個股新聞）")
 
     content = "\n".join(parts)
