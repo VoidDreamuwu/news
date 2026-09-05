@@ -24,6 +24,9 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import requests
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -41,7 +44,7 @@ KEYWORD_STOPWORDS = {
     "AI", "台股", "大盤", "美股", "台積電", "半導體", "財報", "股價", "投資", "外資",
     "台灣", "營收", "美國", "股市", "科技", "電子股", "上市", "上櫃", "台指期",
 }
-TRENDING_MIN_MENTIONS = 2
+TRENDING_MIN_MENTIONS = 1
 TRENDING_TOP_N = 5
 KEYWORD_MIN_COUNT = 3
 KEYWORD_TOP_N = 5
@@ -136,7 +139,13 @@ def fetch_company_name_lookup():
     except Exception as e:
         print(f"  TWSE company list fetch failed: {e}")
     try:
-        r = requests.get(TPEX_COMPANY_URL, headers={"Accept": "application/json"}, timeout=20)
+        try:
+            r = requests.get(TPEX_COMPANY_URL, headers={"Accept": "application/json"}, timeout=20)
+        except requests.exceptions.SSLError:
+            # tpex.org.tw的憑證有已知技術性瑕疵(缺Subject Key Identifier),在部分環境下驗證失敗;
+            # 這裡只是拿公開公司名單(非敏感資料),容錯改用不驗證憑證的方式重試一次。
+            print("  TPEx SSL verify failed, retrying without verification ...")
+            r = requests.get(TPEX_COMPANY_URL, headers={"Accept": "application/json"}, timeout=20, verify=False)
         r.raise_for_status()
         for row in r.json():
             code, name = row.get("SecuritiesCompanyCode"), row.get("CompanyAbbreviation")
