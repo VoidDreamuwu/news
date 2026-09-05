@@ -31,6 +31,8 @@ if hasattr(sys.stdout, "reconfigure"):
 WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 SEARCH_URL = "https://query1.finance.yahoo.com/v1/finance/search"
 CNYES_URL = "https://api.cnyes.com/media/api/v1/newslist/category/tw_stock_news"
+UDN_SEARCH_URL = "https://udn.com/api/more"
+TW_TIMEZONE = timezone(timedelta(hours=8))
 
 # 目標台股代號(鉅亨網用純數字代號比對)——大型權值股 + 中小型科技股
 TW_STOCK_CODES = {
@@ -108,6 +110,34 @@ def fetch_tw_news(since_ts):
     return per_stock
 
 
+def fetch_udn_news(code, name, since_ts):
+    """經濟日報/udn.com,用『公司名稱是否出現在標題』二次過濾(搜尋結果本身不夠精準)。"""
+    try:
+        r = requests.get(UDN_SEARCH_URL, params={"page": 1, "id": f"search:{code}",
+                                                     "channelId": 2, "type": "searchword"},
+                          headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        r.raise_for_status()
+        items = r.json().get("lists", []) or []
+    except Exception as e:
+        print(f"  udn {code}: fetch failed: {e}")
+        return []
+    results = []
+    for it in items:
+        title = it.get("title", "").strip()
+        if name not in title:
+            continue                                   # 公司名稱沒出現在標題,搜尋結果不夠相關,跳過
+        dt_str = it.get("time", {}).get("dateTime", "")
+        try:
+            dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M").replace(tzinfo=TW_TIMEZONE)
+        except ValueError:
+            continue
+        pub_ts = int(dt.timestamp())
+        if pub_ts < since_ts:
+            continue
+        results.append({"title": title, "publisher": "經濟日報", "ts": pub_ts})
+    return results[:MAX_ITEMS_PER_TICKER]
+
+
 def fetch_news_for(symbol, since_ts):
     try:
         r = requests.get(SEARCH_URL, params={"q": symbol, "newsCount": 8},
@@ -154,7 +184,10 @@ def build_digest(report_type):
 
     tw_news = fetch_tw_news(since_ts)
     for code, name in TW_STOCK_CODES.items():
-        for item in tw_news.get(code, []):
+        combined = list(tw_news.get(code, []))
+        combined.extend(fetch_udn_news(code, name, since_ts))
+        time.sleep(0.2)
+        for item in combined[:MAX_ITEMS_PER_TICKER]:
             key = item["title"][:60]
             if key in seen_titles:
                 continue
