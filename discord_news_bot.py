@@ -40,6 +40,7 @@ TPEX_COMPANY_URL = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O"  # �
 MOPS_MATERIAL_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap04_L"  # 上市公司每日重大訊息(官方強制揭露)
 INSTITUTIONAL_FLOW_URL = "https://www.twse.com.tw/rwd/zh/fund/BFI82U"     # 三大法人買賣金額統計表(官方,免key)
 STOCK_FLOW_URL = "https://www.twse.com.tw/rwd/zh/fund/T86"                # 個股三大法人買賣超(官方,免key)
+STOCK_PRICE_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"  # 全部個股當日收盤價(官方,免key)
 TW_TIMEZONE = timezone(timedelta(hours=8))
 
 SECTOR_TOP_N = 5
@@ -272,10 +273,28 @@ def fetch_institutional_flow():
     }
 
 
-def fetch_sector_flow(industry_lookup):
-    """個股三大法人買賣超股數,依官方產業分類加總,抓資金流入/流出最多的產業。
-    這裡加總的是『股數』不是金額(避免還要再抓一次每股股價做換算),
-    數字大小受個股股本/股價差異影響,只能看『方向』,不能直接當金額解讀。"""
+def fetch_stock_price_lookup():
+    """全部上市證券當日收盤價,免key,用來把T86的買賣超股數換算成金額。"""
+    lookup = {}
+    try:
+        r = requests.get(STOCK_PRICE_URL, headers={"Accept": "application/json"}, timeout=20)
+        r.raise_for_status()
+        for row in r.json():
+            code = row.get("Code", "").strip()
+            price = row.get("ClosingPrice")
+            if code and price:
+                try:
+                    lookup[code] = float(price)
+                except ValueError:
+                    pass
+    except Exception as e:
+        print(f"  Stock price lookup fetch failed: {e}")
+    return lookup
+
+
+def fetch_sector_flow(industry_lookup, price_lookup):
+    """個股三大法人買賣超股數 x 當日收盤價 = 買賣超金額,依官方產業分類加總,
+    抓資金流入/流出最多的產業(單位:新台幣億元)。"""
     try:
         r = requests.get(STOCK_FLOW_URL, params={"response": "json", "date": "", "selectType": "ALLBUT0999"},
                           headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
@@ -287,17 +306,18 @@ def fetch_sector_flow(industry_lookup):
         return [], []
 
     from collections import defaultdict
-    sector_net = defaultdict(int)
+    sector_net = defaultdict(float)
     for row in rows:
         if len(row) < 19:
             continue
         code = row[0].strip()
         ind_code = industry_lookup.get(code)
-        if not ind_code:
-            continue
+        price = price_lookup.get(code)
+        if not ind_code or not price:
+            continue                                    # 沒有產業分類或當天沒收盤價(例如當日暫停交易),跳過
         ind_name = INDUSTRY_CODE_NAMES.get(ind_code, f"產業代碼{ind_code}")
         net_shares = _parse_twse_number(row[18])   # 三大法人買賣超股數(最後一欄)
-        sector_net[ind_name] += net_shares
+        sector_net[ind_name] += net_shares * price / 1e8   # 換算成新台幣億元
 
     ranked = sorted(sector_net.items(), key=lambda x: x[1])
     outflow = [(name, v) for name, v in ranked if v < 0][:SECTOR_TOP_N]
@@ -443,7 +463,8 @@ def build_digest(report_type):
 
     flow = fetch_institutional_flow()
     industry_lookup = fetch_stock_industry_lookup()
-    sector_inflow, sector_outflow = fetch_sector_flow(industry_lookup)
+    price_lookup = fetch_stock_price_lookup()
+    sector_inflow, sector_outflow = fetch_sector_flow(industry_lookup, price_lookup)
 
     seen_titles = set()
     tw_lines, us_lines = [], []
@@ -492,11 +513,11 @@ def build_digest(report_type):
                       f"合計 {flow['合計']:+.1f}")
         parts.append("")
     if sector_inflow or sector_outflow:
-        parts.append("🔄 **產業輪動(依官方產業分類,三大法人買賣超股數方向,非精確金額排行)**")
+        parts.append("🔄 **產業輪動(依官方產業分類,三大法人買賣超金額,億元)**")
         if sector_inflow:
-            parts.append("流入前5：" + "、".join(f"{n}" for n, v in sector_inflow))
+            parts.append("流入：" + "、".join(f"{n}(+{v:.1f}億)" for n, v in sector_inflow))
         if sector_outflow:
-            parts.append("流出前5：" + "、".join(f"{n}" for n, v in sector_outflow))
+            parts.append("流出：" + "、".join(f"{n}({v:+.1f}億)" for n, v in sector_outflow))
         parts.append("")
     if tw_lines:
         parts.append("🇹🇼 **台灣科技股**")
