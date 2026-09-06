@@ -2,8 +2,10 @@ name: TW/US Tech News Digest
 
 on:
   schedule:
-    - cron: "30 23 * * *"   # 07:30 Asia/Taipei (UTC+8)
-    - cron: "0 6 * * *"     # 14:00 Asia/Taipei (UTC+8)
+    # 刻意避開整點/半點這種熱門時段(GitHub官方說明:排程在熱門時段容易被排隊延後),
+    # 用不整的分鐘數降低延遲機率。上次30/0這兩個整點+半點時段,實測延遲了將近1小時40分。
+    - cron: "22 23 * * *"   # ~07:22 Asia/Taipei (UTC+8)
+    - cron: "7 6 * * *"     # ~14:07 Asia/Taipei (UTC+8)
   workflow_dispatch:         # 允許在GitHub網頁上手動觸發測試
 
 jobs:
@@ -21,8 +23,9 @@ jobs:
       - name: Determine which report to run
         id: which
         run: |
-          hour_utc=$(date -u +%H)
-          if [ "$hour_utc" = "23" ]; then
+          # 用github.event.schedule判斷是哪個排程觸發,不要用執行當下的時間判斷——
+          # 排程本身可能延遲到跨過整點,用「現在幾點」判斷會誤判成另一個報告。
+          if [ "${{ github.event.schedule }}" = "22 23 * * *" ]; then
             echo "report=morning" >> "$GITHUB_OUTPUT"
           else
             echo "report=afternoon" >> "$GITHUB_OUTPUT"

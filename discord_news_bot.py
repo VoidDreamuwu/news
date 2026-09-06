@@ -53,8 +53,10 @@ KEYWORD_STOPWORDS = {
 }
 TRENDING_MIN_MENTIONS = 1
 TRENDING_TOP_N = 5
-KEYWORD_MIN_COUNT = 3
+KEYWORD_MIN_COUNT = 2
 KEYWORD_TOP_N = 5
+THEME_MIN_CODES = 2   # 一篇文章同時標記幾檔以上非清單股票代號,就算「產業題材新聞」
+THEME_TOP_N = 4
 
 # 目標台股代號(鉅亨網用純數字代號比對)——大型權值股 + 中小型科技股
 TW_STOCK_CODES = {
@@ -201,12 +203,40 @@ def fetch_company_name_lookup():
     return lookup
 
 
-def detect_trending_stocks(articles, name_lookup):
-    """清單外、短時間內被多篇新聞提及的股票代號——用『提及次數暴增』當『新興熱門』的代理指標。"""
-    from collections import Counter, defaultdict
+def detect_theme_articles(articles, name_lookup):
+    """一篇文章『同時』點名多檔(非清單)股票代號 = 供應鏈/產業題材新聞。
+    這種新聞常常只出現一次(不會像單一熱股那樣被多篇文章重複報導),
+    如果只看『單一代號被提及次數』會被同一天其他代號的提及次數排擠掉,
+    所以獨立判斷:不看次數,看『一篇文章裡有沒有一次點名一整組概念股』。"""
+    lines, used_titles = [], set()
+    for n in articles:
+        stocks = n.get("stock", []) or []
+        codes = [s for s in stocks if s.isdigit() and len(s) == 4 and s not in TW_STOCK_CODES]
+        codes = list(dict.fromkeys(codes))
+        if len(codes) < THEME_MIN_CODES:
+            continue
+        title = n.get("title", "").strip()
+        if title in used_titles:
+            continue
+        used_titles.add(title)
+        names = "、".join(f"{name_lookup.get(c, c)}({c})" for c in codes[:4])
+        lines.append(f"• [{names}]：{title}")
+        if len(lines) >= THEME_TOP_N:
+            break
+    return lines, used_titles
+
+
+def detect_trending_stocks(articles, name_lookup, exclude_titles=None):
+    """清單外、短時間內被多篇新聞提及的股票代號——用『提及次數暴增』當『新興熱門』的代理指標。
+    exclude_titles:已經被detect_theme_articles抓走的文章標題,這裡跳過避免同一則新聞重複出現。"""
+    from collections import Counter
+    exclude_titles = exclude_titles or set()
     counts = Counter()
     sample_title = {}
     for n in articles:
+        title = n.get("title", "").strip()
+        if title in exclude_titles:
+            continue
         stocks = n.get("stock", []) or []
         for code in stocks:
             if not code.isdigit() or len(code) != 4:
@@ -214,7 +244,7 @@ def detect_trending_stocks(articles, name_lookup):
             if code in TW_STOCK_CODES:
                 continue                                # 已經在固定清單裡的不算「新發現」
             counts[code] += 1
-            sample_title.setdefault(code, n.get("title", "").strip())
+            sample_title.setdefault(code, title)
 
     trending = [(code, cnt) for code, cnt in counts.items() if cnt >= TRENDING_MIN_MENTIONS]
     trending.sort(key=lambda x: -x[1])
@@ -332,7 +362,8 @@ def build_digest(report_type):
             mops_lines.append(f"• **{name} {code}**：{item['title']}")
 
     name_lookup = fetch_company_name_lookup()
-    trending_lines = detect_trending_stocks(cnyes_articles, name_lookup)
+    theme_lines, theme_titles = detect_theme_articles(cnyes_articles, name_lookup)
+    trending_lines = detect_trending_stocks(cnyes_articles, name_lookup, exclude_titles=theme_titles)
     trending_keywords = detect_trending_keywords(cnyes_articles)
 
     for symbol, label in US_TICKERS:
@@ -360,6 +391,10 @@ def build_digest(report_type):
         parts.append("📋 **官方重大訊息(MOPS強制揭露,跟媒體報導交叉對照)**")
         parts.extend(mops_lines[:6])
         parts.append("")
+    if theme_lines:
+        parts.append("🏭 **產業題材新聞(單篇同時點名多檔概念股)**")
+        parts.extend(theme_lines)
+        parts.append("")
     if trending_lines:
         parts.append("🔥 **新興熱門股(不在固定清單,短時間內新聞暴增)**")
         parts.extend(trending_lines)
@@ -367,7 +402,7 @@ def build_digest(report_type):
     if trending_keywords:
         kw_str = "、".join(f"{kw}({c}則)" for kw, c in trending_keywords)
         parts.append(f"💡 **今日熱門題材關鍵字**：{kw_str}")
-    if not tw_lines and not us_lines and not mops_lines and not trending_lines:
+    if not tw_lines and not us_lines and not mops_lines and not trending_lines and not theme_lines:
         parts.append("（這個時段沒有偵測到符合條件的重大個股新聞）")
 
     content = "\n".join(parts)
