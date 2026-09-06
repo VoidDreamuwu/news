@@ -38,7 +38,23 @@ UDN_SEARCH_URL = "https://udn.com/api/more"
 TWSE_COMPANY_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L"   # 上市公司名單(免key)
 TPEX_COMPANY_URL = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O"  # 上櫃公司名單(免key)
 MOPS_MATERIAL_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap04_L"  # 上市公司每日重大訊息(官方強制揭露)
+INSTITUTIONAL_FLOW_URL = "https://www.twse.com.tw/rwd/zh/fund/BFI82U"     # 三大法人買賣金額統計表(官方,免key)
+STOCK_FLOW_URL = "https://www.twse.com.tw/rwd/zh/fund/T86"                # 個股三大法人買賣超(官方,免key)
 TW_TIMEZONE = timezone(timedelta(hours=8))
+
+SECTOR_TOP_N = 5
+# TWSE官方產業別代碼對照(公司基本資料檔裡的「產業別」欄位是代碼,不是名稱)
+INDUSTRY_CODE_NAMES = {
+    "01": "水泥工業", "02": "食品工業", "03": "塑膠工業", "04": "紡織纖維",
+    "05": "電機機械", "06": "電器電纜", "08": "玻璃陶瓷", "09": "造紙工業",
+    "10": "鋼鐵工業", "11": "橡膠工業", "12": "汽車工業", "14": "建材營造",
+    "15": "航運業", "16": "觀光事業", "17": "金融保險", "18": "貿易百貨",
+    "20": "其他", "21": "化學工業", "22": "生技醫療業", "23": "油電燃氣業",
+    "24": "半導體業", "25": "電腦及週邊設備業", "26": "光電業", "27": "通信網路業",
+    "28": "電子零組件業", "29": "電子通路業", "30": "資訊服務業", "31": "其他電子業",
+    "35": "文化創意業", "36": "農業科技業", "37": "電子商務業", "38": "綠能環保業",
+    "91": "存託憑證",
+}
 
 # MOPS重大訊息的「主旨」裡,含這些字樣的算行政程序性公告,不是真正有意義的個股新聞,排除
 MOPS_ROUTINE_PATTERNS = [
@@ -203,6 +219,92 @@ def fetch_company_name_lookup():
     return lookup
 
 
+def fetch_stock_industry_lookup():
+    """上市公司代號→產業別代碼(只有TWSE上市公司有這個欄位,上櫃沒有,產業輪動只涵蓋上市股)。"""
+    lookup = {}
+    try:
+        r = requests.get(TWSE_COMPANY_URL, headers={"Accept": "application/json"}, timeout=20)
+        r.raise_for_status()
+        for row in r.json():
+            code, ind = row.get("公司代號"), row.get("產業別")
+            if code and ind:
+                lookup[code] = ind
+    except Exception as e:
+        print(f"  TWSE industry lookup fetch failed: {e}")
+    return lookup
+
+
+def _parse_twse_number(s):
+    try:
+        return int(str(s).replace(",", "").strip())
+    except (ValueError, TypeError):
+        return 0
+
+
+def fetch_institutional_flow():
+    """三大法人(外資/投信/自營商)當日買賣金額統計,官方資料,單位新台幣億元。"""
+    try:
+        r = requests.get(INSTITUTIONAL_FLOW_URL, params={"response": "json", "dayDate": "", "type": "day"},
+                          headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+        r.raise_for_status()
+        d = r.json()
+        rows = d.get("data", [])
+        as_of = d.get("date", "")
+    except Exception as e:
+        print(f"  Institutional flow fetch failed: {e}")
+        return None
+
+    net = {"自營商(自行)": 0, "自營商(避險)": 0, "投信": 0, "外資及陸資": 0, "外資自營商": 0}
+    for row in rows:
+        if len(row) < 4:
+            continue
+        name, buy, sell, diff = row[0], row[1], row[2], row[3]
+        for key in net:
+            if name.startswith(key.split("(")[0]) and (("(" not in key) or (key.split("(")[1][:-1] in name)):
+                net[key] = _parse_twse_number(diff)
+                break
+    foreign = net["外資及陸資"] + net["外資自營商"]
+    dealer = net["自營商(自行)"] + net["自營商(避險)"]
+    trust = net["投信"]
+    return {
+        "as_of": as_of, "外資": foreign / 1e8, "投信": trust / 1e8,
+        "自營商": dealer / 1e8, "合計": (foreign + trust + dealer) / 1e8,
+    }
+
+
+def fetch_sector_flow(industry_lookup):
+    """個股三大法人買賣超股數,依官方產業分類加總,抓資金流入/流出最多的產業。
+    這裡加總的是『股數』不是金額(避免還要再抓一次每股股價做換算),
+    數字大小受個股股本/股價差異影響,只能看『方向』,不能直接當金額解讀。"""
+    try:
+        r = requests.get(STOCK_FLOW_URL, params={"response": "json", "date": "", "selectType": "ALLBUT0999"},
+                          headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+        r.raise_for_status()
+        d = r.json()
+        rows = d.get("data", [])
+    except Exception as e:
+        print(f"  Sector flow fetch failed: {e}")
+        return [], []
+
+    from collections import defaultdict
+    sector_net = defaultdict(int)
+    for row in rows:
+        if len(row) < 19:
+            continue
+        code = row[0].strip()
+        ind_code = industry_lookup.get(code)
+        if not ind_code:
+            continue
+        ind_name = INDUSTRY_CODE_NAMES.get(ind_code, f"產業代碼{ind_code}")
+        net_shares = _parse_twse_number(row[18])   # 三大法人買賣超股數(最後一欄)
+        sector_net[ind_name] += net_shares
+
+    ranked = sorted(sector_net.items(), key=lambda x: x[1])
+    outflow = [(name, v) for name, v in ranked if v < 0][:SECTOR_TOP_N]
+    inflow = [(name, v) for name, v in reversed(ranked) if v > 0][:SECTOR_TOP_N]
+    return inflow, outflow
+
+
 def detect_theme_articles(articles, name_lookup):
     """一篇文章『同時』點名多檔(非清單)股票代號 = 供應鏈/產業題材新聞。
     這種新聞常常只出現一次(不會像單一熱股那樣被多篇文章重複報導),
@@ -339,6 +441,10 @@ def build_digest(report_type):
         header = f"📊 台美科技股新聞 | 盤後報 {tw_now.strftime('%Y-%m-%d')}"
     since_ts = int(since.timestamp())
 
+    flow = fetch_institutional_flow()
+    industry_lookup = fetch_stock_industry_lookup()
+    sector_inflow, sector_outflow = fetch_sector_flow(industry_lookup)
+
     seen_titles = set()
     tw_lines, us_lines = [], []
 
@@ -379,6 +485,19 @@ def build_digest(report_type):
     us_lines = us_lines[:MAX_TOTAL_ITEMS // 2]
 
     parts = [header, ""]
+    if flow:
+        as_of_fmt = f"{flow['as_of'][:4]}/{flow['as_of'][4:6]}/{flow['as_of'][6:]}" if flow.get("as_of") else "?"
+        parts.append(f"💰 **資金方向({as_of_fmt}收盤,三大法人買賣超,億元)**")
+        parts.append(f"外資 {flow['外資']:+.1f}　投信 {flow['投信']:+.1f}　自營商 {flow['自營商']:+.1f}　"
+                      f"合計 {flow['合計']:+.1f}")
+        parts.append("")
+    if sector_inflow or sector_outflow:
+        parts.append("🔄 **產業輪動(依官方產業分類,三大法人買賣超股數方向,非精確金額排行)**")
+        if sector_inflow:
+            parts.append("流入前5：" + "、".join(f"{n}" for n, v in sector_inflow))
+        if sector_outflow:
+            parts.append("流出前5：" + "、".join(f"{n}" for n, v in sector_outflow))
+        parts.append("")
     if tw_lines:
         parts.append("🇹🇼 **台灣科技股**")
         parts.extend(tw_lines)
