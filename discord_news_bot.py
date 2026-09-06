@@ -40,7 +40,8 @@ TPEX_COMPANY_URL = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O"  # �
 MOPS_MATERIAL_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap04_L"  # 上市公司每日重大訊息(官方強制揭露)
 INSTITUTIONAL_FLOW_URL = "https://www.twse.com.tw/rwd/zh/fund/BFI82U"     # 三大法人買賣金額統計表(官方,免key)
 STOCK_FLOW_URL = "https://www.twse.com.tw/rwd/zh/fund/T86"                # 個股三大法人買賣超(官方,免key)
-STOCK_PRICE_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"  # 全部個股當日收盤價(官方,免key)
+STOCK_PRICE_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"  # 上市個股當日收盤價(官方,免key)
+TPEX_PRICE_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"  # 上櫃個股當日收盤價(官方,免key)
 TW_TIMEZONE = timezone(timedelta(hours=8))
 
 SECTOR_TOP_N = 5
@@ -97,6 +98,20 @@ US_TICKERS = [
     ("SMCI", "Super Micro"), ("ALAB", "Astera Labs"), ("CRDO", "Credo"),
     ("MPWR", "Monolithic Power"), ("LSCC", "Lattice Semi"),
 ]
+
+# 自訂概念股族群(手動整理,非官方/非付費資料源的分類,盡量參考業界常見的分法,
+# 但不保證跟任何特定看盤軟體的名單一致)。一檔股票可以出現在多個族群裡。
+# 每個代號都對照官方上市/上櫃公司名單核對過,避免記錯代碼。
+THEME_GROUPS = {
+    "LED": ["2393", "6854", "3339"],                          # 億光/錼創科技-KY/泰谷(上櫃)
+    "被動元件": ["2327", "2492", "3026"],                      # 國巨/華新科/禾伸堂
+    "太陽能": ["3576", "6443", "6244", "3691"],                # 聯合再生/元晶/茂迪(上櫃)/碩禾(上櫃)
+    "半導體設備與材料": ["3583", "3131", "3680"],              # 辛耘/弘塑(上櫃)/家登(上櫃)
+    "半導體通路": ["3036", "3702"],                            # 文曄/大聯大
+    "電池": ["6121", "3211"],                                  # 新普(上櫃)/順達(上櫃)
+    "軟體服務": ["6214", "2480", "3029"],                      # 精誠/敦陽科/零壹
+}
+THEME_TOP_N_DISPLAY = 6
 
 MAX_ITEMS_PER_TICKER = 2
 MAX_TOTAL_ITEMS = 20
@@ -292,6 +307,62 @@ def fetch_stock_price_lookup():
     return lookup
 
 
+def fetch_stock_change_lookup():
+    """上市(TWSE)+上櫃(TPEx)全部證券當日漲跌幅(%),免key,用來算自訂概念股族群的
+    平均漲跌幅。Change欄位是『今日收盤 - 昨日收盤』的點數(帶正負號),
+    除以昨收(=收盤-漲跌)換算成百分比。"""
+    lookup = {}
+    try:
+        r = requests.get(STOCK_PRICE_URL, headers={"Accept": "application/json"}, timeout=20)
+        r.raise_for_status()
+        for row in r.json():
+            code = row.get("Code", "").strip()
+            try:
+                close = float(row.get("ClosingPrice"))
+                change = float(row.get("Change"))
+                prev_close = close - change
+                if prev_close > 0:
+                    lookup[code] = change / prev_close * 100
+            except (TypeError, ValueError):
+                continue
+    except Exception as e:
+        print(f"  TWSE stock change lookup fetch failed: {e}")
+    try:
+        try:
+            r = requests.get(TPEX_PRICE_URL, headers={"Accept": "application/json"}, timeout=20)
+        except requests.exceptions.SSLError:
+            r = requests.get(TPEX_PRICE_URL, headers={"Accept": "application/json"}, timeout=20, verify=False)
+        r.raise_for_status()
+        for row in r.json():
+            code = row.get("SecuritiesCompanyCode", "").strip()
+            try:
+                close = float(row.get("Close"))
+                change = float(row.get("Change"))
+                prev_close = close - change
+                if prev_close > 0:
+                    lookup[code] = change / prev_close * 100
+            except (TypeError, ValueError):
+                continue
+    except Exception as e:
+        print(f"  TPEx stock change lookup fetch failed: {e}")
+    return lookup
+
+
+def fetch_theme_group_performance(change_lookup):
+    """自訂概念股族群(手動整理,非官方分類,一檔股票可以同時屬於多個族群)的
+    當日平均漲跌幅排行——等權重平均,不是市值加權,跟一般股市看盤軟體的
+    族群漲跌幅可能有落差。"""
+    results = []
+    for theme, codes in THEME_GROUPS.items():
+        pcts = [change_lookup[c] for c in codes if c in change_lookup]
+        if not pcts:
+            continue
+        avg = sum(pcts) / len(pcts)
+        results.append((theme, avg, len(pcts)))
+    results.sort(key=lambda x: -x[1])
+    return results
+
+
 def fetch_sector_flow(industry_lookup, price_lookup):
     """個股三大法人買賣超股數 x 當日收盤價 = 買賣超金額,依官方產業分類加總,
     抓資金流入/流出最多的產業(單位:新台幣億元)。"""
@@ -465,6 +536,8 @@ def build_digest(report_type):
     industry_lookup = fetch_stock_industry_lookup()
     price_lookup = fetch_stock_price_lookup()
     sector_inflow, sector_outflow = fetch_sector_flow(industry_lookup, price_lookup)
+    change_lookup = fetch_stock_change_lookup()
+    theme_performance = fetch_theme_group_performance(change_lookup)
 
     seen_titles = set()
     tw_lines, us_lines = [], []
@@ -518,6 +591,11 @@ def build_digest(report_type):
             parts.append("流入：" + "、".join(f"{n}(+{v:.1f}億)" for n, v in sector_inflow))
         if sector_outflow:
             parts.append("流出：" + "、".join(f"{n}({v:+.1f}億)" for n, v in sector_outflow))
+        parts.append("")
+    if theme_performance:
+        parts.append("📊 **概念股族群漲跌幅(自訂分類,等權重平均,非官方/非市值加權)**")
+        for theme, avg, n in theme_performance[:THEME_TOP_N_DISPLAY]:
+            parts.append(f"{theme}({n}檔) {avg:+.2f}%")
         parts.append("")
     if tw_lines:
         parts.append("🇹🇼 **台灣科技股**")
