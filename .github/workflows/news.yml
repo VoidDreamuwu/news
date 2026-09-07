@@ -4,8 +4,9 @@ on:
   schedule:
     # 刻意避開整點/半點這種熱門時段(GitHub官方說明:排程在熱門時段容易被排隊延後),
     # 用不整的分鐘數降低延遲機率。上次30/0這兩個整點+半點時段,實測延遲了將近1小時40分。
-    - cron: "22 23 * * *"   # ~07:22 Asia/Taipei (UTC+8)
-    - cron: "7 6 * * *"     # ~14:07 Asia/Taipei (UTC+8)
+    - cron: "22 23 * * *"   # ~07:22 Asia/Taipei (UTC+8) - 早報(新聞)
+    - cron: "7 6 * * *"     # ~14:07 Asia/Taipei (UTC+8) - 盤後報(新聞)
+    - cron: "37 9 * * *"    # ~17:37 Asia/Taipei (UTC+8) - 資金流向報告(三大法人資料通常傍晚才更新完當天的)
   workflow_dispatch:         # 允許在GitHub網頁上手動觸發測試
 
 jobs:
@@ -27,6 +28,8 @@ jobs:
           # 排程本身可能延遲到跨過整點,用「現在幾點」判斷會誤判成另一個報告。
           if [ "${{ github.event.schedule }}" = "22 23 * * *" ]; then
             echo "report=morning" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.schedule }}" = "37 9 * * *" ]; then
+            echo "report=flow" >> "$GITHUB_OUTPUT"
           else
             echo "report=afternoon" >> "$GITHUB_OUTPUT"
           fi

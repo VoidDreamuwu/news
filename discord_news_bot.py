@@ -559,6 +559,66 @@ def fetch_news_for(symbol, since_ts):
     return items[:MAX_ITEMS_PER_TICKER]
 
 
+def build_flow_digest():
+    """資金流向報告(資金方向/產業輪動/概念股族群/投信外資個股買超賣超)。
+    三大法人資料(T86/BFI82U)證交所通常要到傍晚才會更新當天的,
+    所以獨立成17:30左右的第三份報告,不跟07:22/14:07的新聞報告混在一起
+    (混在14:07那份的話,長期只會顯示到前一個交易日的資料)。"""
+    now = datetime.now(timezone.utc)
+    tw_now = now.astimezone(timezone(timedelta(hours=8)))
+    header = f"💰 資金流向報告 | {tw_now.strftime('%Y-%m-%d')} 17:30"
+
+    flow = fetch_institutional_flow()
+    industry_lookup = fetch_stock_industry_lookup()
+    price_lookup = fetch_stock_price_lookup()
+    name_lookup = fetch_company_name_lookup()
+    sector_inflow, sector_outflow = fetch_sector_flow(industry_lookup, price_lookup)
+    change_lookup = fetch_stock_change_lookup()
+    theme_performance = fetch_theme_group_performance(change_lookup)
+    stock_ranking = fetch_institutional_stock_ranking(price_lookup, change_lookup, name_lookup)
+
+    parts = [header, ""]
+    if flow:
+        as_of_fmt = f"{flow['as_of'][:4]}/{flow['as_of'][4:6]}/{flow['as_of'][6:]}" if flow.get("as_of") else "?"
+        parts.append(f"💰 **資金方向({as_of_fmt}收盤,三大法人買賣超,億元)**")
+        parts.append(f"外資 {flow['外資']:+.1f}　投信 {flow['投信']:+.1f}　自營商 {flow['自營商']:+.1f}　"
+                      f"合計 {flow['合計']:+.1f}")
+        parts.append("")
+    if sector_inflow or sector_outflow:
+        parts.append("🔄 **產業輪動(依官方產業分類,三大法人買賣超金額,億元)**")
+        if sector_inflow:
+            parts.append("流入：" + "、".join(f"{n}(+{v:.1f}億)" for n, v in sector_inflow))
+        if sector_outflow:
+            parts.append("流出：" + "、".join(f"{n}({v:+.1f}億)" for n, v in sector_outflow))
+        parts.append("")
+    if theme_performance:
+        parts.append("📊 **概念股族群漲跌幅(自訂分類,等權重平均,非官方/非市值加權)**")
+        for theme, avg, n in theme_performance[:THEME_TOP_N_DISPLAY]:
+            parts.append(f"{theme}({n}檔) {avg:+.2f}%")
+        parts.append("")
+    if stock_ranking:
+        def fmt_rank(items):
+            out = []
+            for code, name, amt, chg in items:
+                chg_str = f"{chg:+.1f}%" if chg is not None else "?"
+                out.append(f"{name}({code}) {amt:+.1f}億(漲跌{chg_str})")
+            return "、".join(out) if out else "無"
+
+        parts.append("📈📉 **投信/外資 個股買超賣超排行(億元,搭配當日漲跌幅)**")
+        parts.append(f"投信買超：{fmt_rank(stock_ranking.get('投信買超', []))}")
+        parts.append(f"投信賣超：{fmt_rank(stock_ranking.get('投信賣超', []))}")
+        parts.append(f"外資買超：{fmt_rank(stock_ranking.get('外資買超', []))}")
+        parts.append(f"外資賣超：{fmt_rank(stock_ranking.get('外資賣超', []))}")
+        parts.append("")
+    if not flow and not sector_inflow and not sector_outflow and not theme_performance and not stock_ranking:
+        parts.append("（今天沒有抓到資金流向資料，可能是非交易日或資料尚未公布）")
+
+    content = "\n".join(parts)
+    if len(content) > 1900:
+        content = content[:1900] + "\n...(截斷)"
+    return content
+
+
 def build_digest(report_type):
     now = datetime.now(timezone.utc)
     tw_now = now.astimezone(timezone(timedelta(hours=8)))  # 台北時間,不依賴runner的本地時區設定
@@ -569,15 +629,7 @@ def build_digest(report_type):
         since = now - timedelta(hours=7)
         header = f"📊 台美科技股新聞 | 盤後報 {tw_now.strftime('%Y-%m-%d')}"
     since_ts = int(since.timestamp())
-
-    flow = fetch_institutional_flow()
-    industry_lookup = fetch_stock_industry_lookup()
-    price_lookup = fetch_stock_price_lookup()
     name_lookup = fetch_company_name_lookup()
-    sector_inflow, sector_outflow = fetch_sector_flow(industry_lookup, price_lookup)
-    change_lookup = fetch_stock_change_lookup()
-    theme_performance = fetch_theme_group_performance(change_lookup)
-    stock_ranking = fetch_institutional_stock_ranking(price_lookup, change_lookup, name_lookup)
 
     seen_titles = set()
     tw_lines, us_lines = [], []
@@ -618,38 +670,6 @@ def build_digest(report_type):
     us_lines = us_lines[:MAX_TOTAL_ITEMS // 2]
 
     parts = [header, ""]
-    if flow:
-        as_of_fmt = f"{flow['as_of'][:4]}/{flow['as_of'][4:6]}/{flow['as_of'][6:]}" if flow.get("as_of") else "?"
-        parts.append(f"💰 **資金方向({as_of_fmt}收盤,三大法人買賣超,億元)**")
-        parts.append(f"外資 {flow['外資']:+.1f}　投信 {flow['投信']:+.1f}　自營商 {flow['自營商']:+.1f}　"
-                      f"合計 {flow['合計']:+.1f}")
-        parts.append("")
-    if sector_inflow or sector_outflow:
-        parts.append("🔄 **產業輪動(依官方產業分類,三大法人買賣超金額,億元)**")
-        if sector_inflow:
-            parts.append("流入：" + "、".join(f"{n}(+{v:.1f}億)" for n, v in sector_inflow))
-        if sector_outflow:
-            parts.append("流出：" + "、".join(f"{n}({v:+.1f}億)" for n, v in sector_outflow))
-        parts.append("")
-    if theme_performance:
-        parts.append("📊 **概念股族群漲跌幅(自訂分類,等權重平均,非官方/非市值加權)**")
-        for theme, avg, n in theme_performance[:THEME_TOP_N_DISPLAY]:
-            parts.append(f"{theme}({n}檔) {avg:+.2f}%")
-        parts.append("")
-    if stock_ranking:
-        def fmt_rank(items):
-            out = []
-            for code, name, amt, chg in items:
-                chg_str = f"{chg:+.1f}%" if chg is not None else "?"
-                out.append(f"{name}({code}) {amt:+.1f}億(漲跌{chg_str})")
-            return "、".join(out) if out else "無"
-
-        parts.append("📈📉 **投信/外資 個股買超賣超排行(億元,搭配當日漲跌幅)**")
-        parts.append(f"投信買超：{fmt_rank(stock_ranking.get('投信買超', []))}")
-        parts.append(f"投信賣超：{fmt_rank(stock_ranking.get('投信賣超', []))}")
-        parts.append(f"外資買超：{fmt_rank(stock_ranking.get('外資買超', []))}")
-        parts.append(f"外資賣超：{fmt_rank(stock_ranking.get('外資賣超', []))}")
-        parts.append("")
     if tw_lines:
         parts.append("🇹🇼 **台灣科技股**")
         parts.extend(tw_lines)
@@ -695,11 +715,11 @@ def post_to_discord(content):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--report", choices=["morning", "afternoon"], required=True)
+    ap.add_argument("--report", choices=["morning", "afternoon", "flow"], required=True)
     args = ap.parse_args()
 
     print(f"===== {datetime.now().isoformat()} | {args.report} =====")
-    content = build_digest(args.report)
+    content = build_flow_digest() if args.report == "flow" else build_digest(args.report)
     print(content)
     print("Posting to Discord ...")
     post_to_discord(content)
