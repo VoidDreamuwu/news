@@ -45,6 +45,7 @@ TPEX_PRICE_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_
 TW_TIMEZONE = timezone(timedelta(hours=8))
 
 SECTOR_TOP_N = 5
+STOCK_RANK_TOP_N = 3
 # TWSE官方產業別代碼對照(公司基本資料檔裡的「產業別」欄位是代碼,不是名稱)
 INDUSTRY_CODE_NAMES = {
     "01": "水泥工業", "02": "食品工業", "03": "塑膠工業", "04": "紡織纖維",
@@ -396,6 +397,43 @@ def fetch_sector_flow(industry_lookup, price_lookup):
     return inflow, outflow
 
 
+def fetch_institutional_stock_ranking(price_lookup, change_lookup, name_lookup):
+    """投信/外資 個股買超/賣超金額排行(億元),搭配當日漲跌幅——
+    跟fetch_sector_flow用同一份T86資料,但保留個股層級不加總。"""
+    try:
+        r = requests.get(STOCK_FLOW_URL, params={"response": "json", "date": "", "selectType": "ALLBUT0999"},
+                          headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+        r.raise_for_status()
+        rows = r.json().get("data", [])
+    except Exception as e:
+        print(f"  Institutional stock ranking fetch failed: {e}")
+        return {}
+
+    trust_list, foreign_list = [], []
+    for row in rows:
+        if len(row) < 19:
+            continue
+        code = row[0].strip()
+        price = price_lookup.get(code)
+        if not price:
+            continue                                    # 沒有收盤價(例如當日暫停交易),跳過
+        name = name_lookup.get(code, code)
+        chg = change_lookup.get(code)
+        foreign_shares = _parse_twse_number(row[4]) + _parse_twse_number(row[7])   # 外資(不含自營商)+外資自營商
+        trust_shares = _parse_twse_number(row[10])                                  # 投信買賣超股數
+        foreign_list.append((code, name, foreign_shares * price / 1e8, chg))
+        trust_list.append((code, name, trust_shares * price / 1e8, chg))
+
+    def top_bottom(lst):
+        buy = sorted([x for x in lst if x[2] > 0], key=lambda x: -x[2])[:STOCK_RANK_TOP_N]
+        sell = sorted([x for x in lst if x[2] < 0], key=lambda x: x[2])[:STOCK_RANK_TOP_N]
+        return buy, sell
+
+    trust_buy, trust_sell = top_bottom(trust_list)
+    foreign_buy, foreign_sell = top_bottom(foreign_list)
+    return {"投信買超": trust_buy, "投信賣超": trust_sell, "外資買超": foreign_buy, "外資賣超": foreign_sell}
+
+
 def detect_theme_articles(articles, name_lookup):
     """一篇文章『同時』點名多檔(非清單)股票代號 = 供應鏈/產業題材新聞。
     這種新聞常常只出現一次(不會像單一熱股那樣被多篇文章重複報導),
@@ -535,9 +573,11 @@ def build_digest(report_type):
     flow = fetch_institutional_flow()
     industry_lookup = fetch_stock_industry_lookup()
     price_lookup = fetch_stock_price_lookup()
+    name_lookup = fetch_company_name_lookup()
     sector_inflow, sector_outflow = fetch_sector_flow(industry_lookup, price_lookup)
     change_lookup = fetch_stock_change_lookup()
     theme_performance = fetch_theme_group_performance(change_lookup)
+    stock_ranking = fetch_institutional_stock_ranking(price_lookup, change_lookup, name_lookup)
 
     seen_titles = set()
     tw_lines, us_lines = [], []
@@ -561,7 +601,6 @@ def build_digest(report_type):
         for item in mops_news.get(code, [])[:MAX_ITEMS_PER_TICKER]:
             mops_lines.append(f"• **{name} {code}**：{item['title']}")
 
-    name_lookup = fetch_company_name_lookup()
     theme_lines, theme_titles = detect_theme_articles(cnyes_articles, name_lookup)
     trending_lines = detect_trending_stocks(cnyes_articles, name_lookup, exclude_titles=theme_titles)
     trending_keywords = detect_trending_keywords(cnyes_articles)
@@ -596,6 +635,20 @@ def build_digest(report_type):
         parts.append("📊 **概念股族群漲跌幅(自訂分類,等權重平均,非官方/非市值加權)**")
         for theme, avg, n in theme_performance[:THEME_TOP_N_DISPLAY]:
             parts.append(f"{theme}({n}檔) {avg:+.2f}%")
+        parts.append("")
+    if stock_ranking:
+        def fmt_rank(items):
+            out = []
+            for code, name, amt, chg in items:
+                chg_str = f"{chg:+.1f}%" if chg is not None else "?"
+                out.append(f"{name}({code}) {amt:+.1f}億(漲跌{chg_str})")
+            return "、".join(out) if out else "無"
+
+        parts.append("📈📉 **投信/外資 個股買超賣超排行(億元,搭配當日漲跌幅)**")
+        parts.append(f"投信買超：{fmt_rank(stock_ranking.get('投信買超', []))}")
+        parts.append(f"投信賣超：{fmt_rank(stock_ranking.get('投信賣超', []))}")
+        parts.append(f"外資買超：{fmt_rank(stock_ranking.get('外資買超', []))}")
+        parts.append(f"外資賣超：{fmt_rank(stock_ranking.get('外資賣超', []))}")
         parts.append("")
     if tw_lines:
         parts.append("🇹🇼 **台灣科技股**")
