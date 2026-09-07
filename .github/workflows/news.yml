@@ -8,6 +8,15 @@ on:
     - cron: "7 6 * * *"     # ~14:07 Asia/Taipei (UTC+8) - 盤後報(新聞)
     - cron: "37 9 * * *"    # ~17:37 Asia/Taipei (UTC+8) - 資金流向報告(三大法人資料通常傍晚才更新完當天的)
   workflow_dispatch:         # 允許在GitHub網頁上手動觸發測試
+    inputs:
+      report:
+        description: "要測試的報告類型"
+        type: choice
+        default: morning
+        options:
+          - morning
+          - afternoon
+          - flow
 
 jobs:
   send-digest:
@@ -34,12 +43,12 @@ jobs:
             echo "report=afternoon" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Run digest (manual trigger defaults to morning)
+      - name: Run digest
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
           report="${{ steps.which.outputs.report }}"
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            report="morning"
+            report="${{ github.event.inputs.report }}"
           fi
           python discord_news_bot.py --report "$report"
