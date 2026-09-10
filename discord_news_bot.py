@@ -613,10 +613,7 @@ def build_flow_digest():
     if not flow and not sector_inflow and not sector_outflow and not theme_performance and not stock_ranking:
         parts.append("（今天沒有抓到資金流向資料，可能是非交易日或資料尚未公布）")
 
-    content = "\n".join(parts)
-    if len(content) > 1900:
-        content = content[:1900] + "\n...(截斷)"
-    return content
+    return "\n".join(parts)
 
 
 def build_digest(report_type):
@@ -696,21 +693,60 @@ def build_digest(report_type):
     if not tw_lines and not us_lines and not mops_lines and not trending_lines and not theme_lines:
         parts.append("（這個時段沒有偵測到符合條件的重大個股新聞）")
 
-    content = "\n".join(parts)
-    if len(content) > 1900:
-        content = content[:1900] + "\n...(截斷)"
-    return content
+    return "\n".join(parts)
+
+
+DISCORD_MSG_LIMIT = 1900  # Discord訊息硬限制2000字,抓1900留安全邊界
+
+
+def split_into_chunks(content, max_len=DISCORD_MSG_LIMIT):
+    """把長內容切成多則訊息,盡量在空行(段落)分界處切,不要從一行中間硬切斷。"""
+    blocks = content.split("\n\n")
+    chunks, current = [], ""
+
+    def flush():
+        nonlocal current
+        if current:
+            chunks.append(current)
+            current = ""
+
+    for block in blocks:
+        candidate = f"{current}\n\n{block}" if current else block
+        if len(candidate) <= max_len:
+            current = candidate
+            continue
+        flush()
+        if len(block) <= max_len:
+            current = block
+            continue
+        # 單一段落本身就超過長度上限,退而求其次按行切
+        for line in block.split("\n"):
+            candidate = f"{current}\n{line}" if current else line
+            if len(candidate) <= max_len:
+                current = candidate
+            else:
+                flush()
+                current = line[:max_len]
+    flush()
+    return chunks
 
 
 def post_to_discord(content):
     if not WEBHOOK_URL:
         raise SystemExit("DISCORD_WEBHOOK_URL is not set (check the repository secret).")
-    r = requests.post(WEBHOOK_URL, json={"content": content},
-                       headers={"Content-Type": "application/json; charset=utf-8"}, timeout=20)
-    print(f"Discord response: {r.status_code}")
-    if r.status_code != 204:
-        print(r.text)
-        r.raise_for_status()
+
+    chunks = split_into_chunks(content)
+    total = len(chunks)
+    for i, chunk in enumerate(chunks, start=1):
+        text = chunk if total == 1 else f"({i}/{total})\n{chunk}"
+        r = requests.post(WEBHOOK_URL, json={"content": text},
+                           headers={"Content-Type": "application/json; charset=utf-8"}, timeout=20)
+        print(f"Discord response [{i}/{total}]: {r.status_code}")
+        if r.status_code != 204:
+            print(r.text)
+            r.raise_for_status()
+        if i < total:
+            time.sleep(1)
 
 
 def main():
