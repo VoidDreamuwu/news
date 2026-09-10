@@ -364,17 +364,24 @@ def fetch_theme_group_performance(change_lookup):
     return results
 
 
-def fetch_sector_flow(industry_lookup, price_lookup):
-    """個股三大法人買賣超股數 x 當日收盤價 = 買賣超金額,依官方產業分類加總,
-    抓資金流入/流出最多的產業(單位:新台幣億元)。"""
+def fetch_t86_rows():
+    """個股三大法人買賣超(T86)原始資料列,給fetch_sector_flow/
+    fetch_institutional_stock_ranking/fetch_watchlist_institutional_flow共用,
+    避免同一份資料在同一次執行裡被重複抓三次。"""
     try:
         r = requests.get(STOCK_FLOW_URL, params={"response": "json", "date": "", "selectType": "ALLBUT0999"},
                           headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
         r.raise_for_status()
-        d = r.json()
-        rows = d.get("data", [])
+        return r.json().get("data", [])
     except Exception as e:
-        print(f"  Sector flow fetch failed: {e}")
+        print(f"  T86 fetch failed: {e}")
+        return []
+
+
+def fetch_sector_flow(industry_lookup, price_lookup, rows):
+    """個股三大法人買賣超股數 x 當日收盤價 = 買賣超金額,依官方產業分類加總,
+    抓資金流入/流出最多的產業(單位:新台幣億元)。"""
+    if not rows:
         return [], []
 
     from collections import defaultdict
@@ -397,16 +404,10 @@ def fetch_sector_flow(industry_lookup, price_lookup):
     return inflow, outflow
 
 
-def fetch_institutional_stock_ranking(price_lookup, change_lookup, name_lookup):
+def fetch_institutional_stock_ranking(price_lookup, change_lookup, name_lookup, rows):
     """投信/外資 個股買超/賣超金額排行(億元),搭配當日漲跌幅——
     跟fetch_sector_flow用同一份T86資料,但保留個股層級不加總。"""
-    try:
-        r = requests.get(STOCK_FLOW_URL, params={"response": "json", "date": "", "selectType": "ALLBUT0999"},
-                          headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
-        r.raise_for_status()
-        rows = r.json().get("data", [])
-    except Exception as e:
-        print(f"  Institutional stock ranking fetch failed: {e}")
+    if not rows:
         return {}
 
     trust_list, foreign_list = [], []
@@ -432,6 +433,33 @@ def fetch_institutional_stock_ranking(price_lookup, change_lookup, name_lookup):
     trust_buy, trust_sell = top_bottom(trust_list)
     foreign_buy, foreign_sell = top_bottom(foreign_list)
     return {"投信買超": trust_buy, "投信賣超": trust_sell, "外資買超": foreign_buy, "外資賣超": foreign_sell}
+
+
+def fetch_watchlist_institutional_flow(watchlist, price_lookup, change_lookup, name_lookup, rows):
+    """自選股組合(watchlist)裡每一檔的外資/投信買賣超金額(億元)+當日漲跌幅——
+    跟排行榜(fetch_institutional_stock_ranking)不同,這裡不篩選只顯示前幾名,
+    watchlist裡的每一檔都會列出來,不管有沒有上榜。"""
+    if not rows:
+        return {}
+
+    by_code = {row[0].strip(): row for row in rows if len(row) >= 19}
+    result = {}
+    for code, name in watchlist.items():
+        row = by_code.get(code)
+        price = price_lookup.get(code)
+        if not row or not price:
+            continue                                    # 當天沒交易/沒收盤價(例如停牌),跳過
+        chg = change_lookup.get(code)
+        foreign_shares = _parse_twse_number(row[4]) + _parse_twse_number(row[7])
+        trust_shares = _parse_twse_number(row[10])
+        result[code] = {
+            "code": code,
+            "name": name_lookup.get(code, name),
+            "外資": foreign_shares * price / 1e8,
+            "投信": trust_shares * price / 1e8,
+            "漲跌": chg,
+        }
+    return result
 
 
 def detect_theme_articles(articles, name_lookup):
@@ -572,10 +600,13 @@ def build_flow_digest():
     industry_lookup = fetch_stock_industry_lookup()
     price_lookup = fetch_stock_price_lookup()
     name_lookup = fetch_company_name_lookup()
-    sector_inflow, sector_outflow = fetch_sector_flow(industry_lookup, price_lookup)
+    t86_rows = fetch_t86_rows()
+    sector_inflow, sector_outflow = fetch_sector_flow(industry_lookup, price_lookup, t86_rows)
     change_lookup = fetch_stock_change_lookup()
     theme_performance = fetch_theme_group_performance(change_lookup)
-    stock_ranking = fetch_institutional_stock_ranking(price_lookup, change_lookup, name_lookup)
+    stock_ranking = fetch_institutional_stock_ranking(price_lookup, change_lookup, name_lookup, t86_rows)
+    watchlist_flow = fetch_watchlist_institutional_flow(
+        TW_STOCK_CODES, price_lookup, change_lookup, name_lookup, t86_rows)
 
     parts = [header, ""]
     if flow:
@@ -610,7 +641,14 @@ def build_flow_digest():
         parts.append(f"外資買超：{fmt_rank(stock_ranking.get('外資買超', []))}")
         parts.append(f"外資賣超：{fmt_rank(stock_ranking.get('外資賣超', []))}")
         parts.append("")
-    if not flow and not sector_inflow and not sector_outflow and not theme_performance and not stock_ranking:
+    if watchlist_flow:
+        parts.append("📋 **自選股 外資/投信買賣超(億元,依買超金額排序)**")
+        ordered = sorted(watchlist_flow.values(), key=lambda v: v["外資"] + v["投信"], reverse=True)
+        for v in ordered:
+            chg_str = f"{v['漲跌']:+.1f}%" if v["漲跌"] is not None else "?"
+            parts.append(f"{v['name']}({v['code']})：外資{v['外資']:+.1f}億　投信{v['投信']:+.1f}億　({chg_str})")
+        parts.append("")
+    if not flow and not sector_inflow and not sector_outflow and not theme_performance and not stock_ranking and not watchlist_flow:
         parts.append("（今天沒有抓到資金流向資料，可能是非交易日或資料尚未公布）")
 
     return "\n".join(parts)
