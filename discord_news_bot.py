@@ -18,6 +18,7 @@ Webhook網址從環境變數 DISCORD_WEBHOOK_URL 讀取,不寫死在程式碼裡
   DISCORD_WEBHOOK_URL=... python discord_news_bot.py --report afternoon
 """
 import argparse
+import csv
 import os
 import sys
 import time
@@ -485,6 +486,98 @@ def detect_theme_articles(articles, name_lookup):
     return lines, used_titles
 
 
+THEME_CANDIDATE_LOG = "theme_candidate_log.csv"
+THEME_CANDIDATE_MIN_DAYS = 2      # 同一檔股票+族群組合,要在這幾個「不同日期」出現過才算數,避免單篇報導雜訊
+THEME_CANDIDATE_LOOKBACK_DAYS = 14  # 往回看幾天內的紀錄
+
+
+def detect_theme_candidates(articles, theme_groups, name_lookup):
+    """掃新聞,找『標題提到某個族群關鍵字(例如"LED"、"太陽能"),
+    文章也標記了某支股票,但那支股票還不在THEME_GROUPS[該族群]名單裡』的組合——
+    這是族群疑似出現新成員的線索,不是新聞裡同時點名一堆代號那種(那是
+    detect_theme_articles在做的事)。"""
+    hits = []
+    for n in articles:
+        title = n.get("title", "") or ""
+        stocks = n.get("stock", []) or []
+        codes = [s for s in stocks if s.isdigit() and len(s) == 4]
+        if not codes:
+            continue
+        for group, members in theme_groups.items():
+            if group not in title:
+                continue
+            for code in codes:
+                if code in members:
+                    continue
+                hits.append({"group": group, "code": code,
+                             "name": name_lookup.get(code, code), "title": title})
+    return hits
+
+
+def load_theme_candidate_log():
+    if not os.path.exists(THEME_CANDIDATE_LOG):
+        return []
+    with open(THEME_CANDIDATE_LOG, encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        return list(reader)
+
+
+def append_theme_candidate_log(today_hits, today_str):
+    existing = load_theme_candidate_log()
+    seen_today = {(r["date"], r["group"], r["code"]) for r in existing}
+    new_rows = []
+    for h in today_hits:
+        key = (today_str, h["group"], h["code"])
+        if key in seen_today:
+            continue
+        seen_today.add(key)
+        new_rows.append({"date": today_str, "group": h["group"], "code": h["code"],
+                          "name": h["name"], "title": h["title"]})
+    if not new_rows:
+        return existing
+    all_rows = existing + new_rows
+    with open(THEME_CANDIDATE_LOG, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=["date", "group", "code", "name", "title"])
+        writer.writeheader()
+        writer.writerows(all_rows)
+    return all_rows
+
+
+def confirm_theme_candidates(log_rows, theme_groups, today_str,
+                              min_days=THEME_CANDIDATE_MIN_DAYS,
+                              lookback_days=THEME_CANDIDATE_LOOKBACK_DAYS):
+    """只挑『在過去lookback_days天內,出現過至少min_days個不同日期』的族群+股票組合,
+    當作真的值得標記的候選(單篇報導的雜訊會被濾掉),而且要排除已經正式加進
+    THEME_GROUPS的(代表使用者已經手動採納,不用再提醒)。"""
+    cutoff = (datetime.strptime(today_str, "%Y-%m-%d") - timedelta(days=lookback_days)).date()
+    by_key = {}
+    for r in log_rows:
+        try:
+            d = datetime.strptime(r["date"], "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if d < cutoff:
+            continue
+        key = (r["group"], r["code"])
+        by_key.setdefault(key, {"dates": set(), "name": r["name"], "titles": []})
+        by_key[key]["dates"].add(d)
+        by_key[key]["titles"].append(r["title"])
+
+    confirmed = []
+    for (group, code), info in by_key.items():
+        if code in theme_groups.get(group, []):
+            continue
+        if len(info["dates"]) >= min_days:
+            confirmed.append({
+                "group": group, "code": code, "name": info["name"],
+                "days_seen": len(info["dates"]),
+                "first_seen": min(info["dates"]).isoformat(),
+                "example_title": info["titles"][0],
+            })
+    confirmed.sort(key=lambda x: (-x["days_seen"], x["group"]))
+    return confirmed
+
+
 def detect_trending_stocks(articles, name_lookup, exclude_titles=None):
     """清單外、短時間內被多篇新聞提及的股票代號——用『提及次數暴增』當『新興熱門』的代理指標。
     exclude_titles:已經被detect_theme_articles抓走的文章標題,這裡跳過避免同一則新聞重複出現。"""
@@ -692,6 +785,11 @@ def build_digest(report_type):
     trending_lines = detect_trending_stocks(cnyes_articles, name_lookup, exclude_titles=theme_titles)
     trending_keywords = detect_trending_keywords(cnyes_articles)
 
+    today_str = tw_now.strftime("%Y-%m-%d")
+    theme_candidate_hits = detect_theme_candidates(cnyes_articles, THEME_GROUPS, name_lookup)
+    log_rows = append_theme_candidate_log(theme_candidate_hits, today_str)
+    confirmed_candidates = confirm_theme_candidates(log_rows, THEME_GROUPS, today_str)
+
     for symbol, label in US_TICKERS:
         for item in fetch_news_for(symbol, since_ts):
             key = item["title"][:60]
@@ -728,6 +826,12 @@ def build_digest(report_type):
     if trending_keywords:
         kw_str = "、".join(f"{kw}({c}則)" for kw, c in trending_keywords)
         parts.append(f"💡 **今日熱門題材關鍵字**：{kw_str}")
+        parts.append("")
+    if confirmed_candidates:
+        parts.append(f"🆕 **族群疑似新成員(新聞同時提到族群關鍵字+股票,{THEME_CANDIDATE_MIN_DAYS}天內出現{THEME_CANDIDATE_MIN_DAYS}次以上)**")
+        for c in confirmed_candidates[:8]:
+            parts.append(f"{c['group']}：{c['name']}({c['code']}) — 近{THEME_CANDIDATE_LOOKBACK_DAYS}天內出現{c['days_seen']}天，"
+                          f"最早{c['first_seen']}（例：{c['example_title'][:40]}）")
     if not tw_lines and not us_lines and not mops_lines and not trending_lines and not theme_lines:
         parts.append("（這個時段沒有偵測到符合條件的重大個股新聞）")
 
