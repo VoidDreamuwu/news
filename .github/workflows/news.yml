@@ -56,14 +56,16 @@ jobs:
           fi
           python discord_news_bot.py --report "$report"
 
-      - name: 儲存族群候選名單的每日紀錄(如果有更新)
+      - name: 儲存族群候選名單/研究卡片庫的更新(如果有變動)
         run: |
-          if [ -n "$(git status --porcelain theme_candidate_log.csv 2>/dev/null)" ]; then
+          for f in theme_candidate_log.csv research_cards.json; do
+            [ -f "$f" ] && git add "$f"
+          done
+          if ! git diff --cached --quiet; then
             git config user.email "noreply@anthropic.com"
             git config user.name "Claude Sonnet 5"
-            git add theme_candidate_log.csv
-            git commit -m "Update theme candidate log [skip ci]"
+            git commit -m "Update theme candidate log / research cards [skip ci]"
             git push
           else
-            echo "沒有新的族群候選紀錄,不用commit"
+            echo "沒有新的紀錄,不用commit"
           fi

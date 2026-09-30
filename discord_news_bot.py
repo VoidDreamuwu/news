@@ -744,7 +744,41 @@ def build_flow_digest():
     if not flow and not sector_inflow and not sector_outflow and not theme_performance and not stock_ranking and not watchlist_flow:
         parts.append("（今天沒有抓到資金流向資料，可能是非交易日或資料尚未公布）")
 
+    card_lines = build_recent_cards_section(tw_now)
+    if card_lines:
+        parts.append("")
+        parts.extend(card_lines)
+
     return "\n".join(parts)
+
+
+def build_recent_cards_section(tw_now, days=7):
+    """研究卡片庫(research_cards.py)裡,最近幾天有新增/更新過的卡片摘要——
+    對應方法論「累積」那段的卡片系統,週期性(預設7天)冒出來提醒你複習/補齊,
+    不是每天都全部列一次。看完整內容/梯隊表/品管結果要另外跑
+    `python research_cards.py show <卡片名稱>`,這裡只放摘要。"""
+    try:
+        import research_cards as rc
+    except ImportError:
+        return []
+    cards = rc.load_cards()
+    if not cards:
+        return []
+    cutoff = (tw_now.date() - timedelta(days=days))
+    recent = []
+    for name, card in cards.items():
+        try:
+            updated = datetime.strptime(card.get("更新日期", ""), "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if updated >= cutoff:
+            recent.append((name, card))
+    if not recent:
+        return []
+    lines = [f"📇 **研究卡片庫(近{days}天有更新的)**"]
+    for name, card in sorted(recent, key=lambda x: x[1].get("更新日期", ""), reverse=True):
+        lines.append(f"• {rc.summary_line(name, card)}")
+    return lines
 
 
 def build_digest(report_type):
