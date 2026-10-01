@@ -381,9 +381,12 @@ def load_industry_classification():
         return json.load(f)
 
 
-def fetch_industry_subcategory_performance(classification, change_lookup):
+def fetch_industry_subcategory_performance(classification, change_lookup, name_lookup=None):
     """依「大分類-小分類」分組,算當日平均漲跌幅(等權重,不是市值加權)——
-    跟fetch_theme_group_performance同樣邏輯,只是改用細分類表當分組依據。"""
+    跟fetch_theme_group_performance同樣邏輯,只是改用細分類表當分組依據。
+    同時把組內每一檔的個股漲跌幅存起來(「個股」欄位,依漲跌幅排序),
+    這樣報告才能列出「這個族群漲,是哪幾支股票在漲」,不是只給平均數。"""
+    name_lookup = name_lookup or {}
     groups = {}
     for row in classification:
         code = row.get("代號")
@@ -391,12 +394,16 @@ def fetch_industry_subcategory_performance(classification, change_lookup):
         if pct is None:
             continue
         key = (row.get("大分類", "?"), row.get("小分類", "?"))
-        groups.setdefault(key, []).append(pct)
+        groups.setdefault(key, []).append({
+            "代號": code, "名稱": name_lookup.get(code, row.get("名稱", code)), "漲跌幅": pct,
+        })
 
     results = []
-    for (big, small), pcts in groups.items():
+    for (big, small), stocks in groups.items():
+        stocks.sort(key=lambda s: -s["漲跌幅"])
+        pcts = [s["漲跌幅"] for s in stocks]
         avg = sum(pcts) / len(pcts)
-        results.append({"大分類": big, "小分類": small, "平均漲跌幅": avg, "檔數": len(pcts)})
+        results.append({"大分類": big, "小分類": small, "平均漲跌幅": avg, "檔數": len(pcts), "個股": stocks})
     results.sort(key=lambda x: -x["平均漲跌幅"])
     return results
 
@@ -734,7 +741,7 @@ def build_flow_digest():
     change_lookup = fetch_stock_change_lookup()
     theme_performance = fetch_theme_group_performance(change_lookup)
     industry_classification = load_industry_classification()
-    subcategory_performance = fetch_industry_subcategory_performance(industry_classification, change_lookup)
+    subcategory_performance = fetch_industry_subcategory_performance(industry_classification, change_lookup, name_lookup)
     stock_ranking = fetch_institutional_stock_ranking(price_lookup, change_lookup, name_lookup, t86_rows)
     watchlist_flow = fetch_watchlist_institutional_flow(
         TW_STOCK_CODES, price_lookup, change_lookup, name_lookup, t86_rows)
@@ -764,6 +771,11 @@ def build_flow_digest():
         worst = subcategory_performance[-INDUSTRY_SUBCATEGORY_TOP_N:][::-1]
         parts.append("最強：" + "、".join(f"{r['大分類']}-{r['小分類']}({r['檔數']}檔) {r['平均漲跌幅']:+.2f}%" for r in best))
         parts.append("最弱：" + "、".join(f"{r['大分類']}-{r['小分類']}({r['檔數']}檔) {r['平均漲跌幅']:+.2f}%" for r in worst))
+        parts.append("")
+        parts.append("📈 **最強分類裡面,個股漲跌明細(漲的在前)**")
+        for r in best:
+            stock_str = "、".join(f"{s['名稱']}({s['代號']}) {s['漲跌幅']:+.2f}%" for s in r["個股"])
+            parts.append(f"{r['大分類']}-{r['小分類']}：{stock_str}")
         parts.append("")
     if stock_ranking:
         def fmt_rank(items):
