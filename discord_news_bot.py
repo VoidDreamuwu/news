@@ -19,6 +19,7 @@ Webhook網址從環境變數 DISCORD_WEBHOOK_URL 讀取,不寫死在程式碼裡
 """
 import argparse
 import csv
+import json
 import os
 import sys
 import time
@@ -365,6 +366,41 @@ def fetch_theme_group_performance(change_lookup):
     return results
 
 
+INDUSTRY_CLASSIFICATION_FILE = "industry_classification.json"
+INDUSTRY_SUBCATEGORY_TOP_N = 5
+
+
+def load_industry_classification():
+    """讀取使用者提供的「台股產業分類表」——每檔股票只歸一類(大分類+小分類),
+    涵蓋約300檔主要上市櫃公司,比THEME_GROUPS(自訂、允許多重歸屬、只有7組)
+    細很多(14個大分類、約70個小分類)。這份不是即時抓的,是靜態檔案,
+    要更新內容(增減個股/分類)請直接改 industry_classification.json。"""
+    if not os.path.exists(INDUSTRY_CLASSIFICATION_FILE):
+        return []
+    with open(INDUSTRY_CLASSIFICATION_FILE, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def fetch_industry_subcategory_performance(classification, change_lookup):
+    """依「大分類-小分類」分組,算當日平均漲跌幅(等權重,不是市值加權)——
+    跟fetch_theme_group_performance同樣邏輯,只是改用細分類表當分組依據。"""
+    groups = {}
+    for row in classification:
+        code = row.get("代號")
+        pct = change_lookup.get(code)
+        if pct is None:
+            continue
+        key = (row.get("大分類", "?"), row.get("小分類", "?"))
+        groups.setdefault(key, []).append(pct)
+
+    results = []
+    for (big, small), pcts in groups.items():
+        avg = sum(pcts) / len(pcts)
+        results.append({"大分類": big, "小分類": small, "平均漲跌幅": avg, "檔數": len(pcts)})
+    results.sort(key=lambda x: -x["平均漲跌幅"])
+    return results
+
+
 def fetch_t86_rows():
     """個股三大法人買賣超(T86)原始資料列,給fetch_sector_flow/
     fetch_institutional_stock_ranking/fetch_watchlist_institutional_flow共用,
@@ -697,6 +733,8 @@ def build_flow_digest():
     sector_inflow, sector_outflow = fetch_sector_flow(industry_lookup, price_lookup, t86_rows)
     change_lookup = fetch_stock_change_lookup()
     theme_performance = fetch_theme_group_performance(change_lookup)
+    industry_classification = load_industry_classification()
+    subcategory_performance = fetch_industry_subcategory_performance(industry_classification, change_lookup)
     stock_ranking = fetch_institutional_stock_ranking(price_lookup, change_lookup, name_lookup, t86_rows)
     watchlist_flow = fetch_watchlist_institutional_flow(
         TW_STOCK_CODES, price_lookup, change_lookup, name_lookup, t86_rows)
@@ -720,6 +758,13 @@ def build_flow_digest():
         for theme, avg, n in theme_performance[:THEME_TOP_N_DISPLAY]:
             parts.append(f"{theme}({n}檔) {avg:+.2f}%")
         parts.append("")
+    if subcategory_performance:
+        parts.append(f"🏭 **產業小分類漲跌幅(依產業分類表,{len(subcategory_performance)}個小分類,等權重平均)**")
+        best = subcategory_performance[:INDUSTRY_SUBCATEGORY_TOP_N]
+        worst = subcategory_performance[-INDUSTRY_SUBCATEGORY_TOP_N:][::-1]
+        parts.append("最強：" + "、".join(f"{r['大分類']}-{r['小分類']}({r['檔數']}檔) {r['平均漲跌幅']:+.2f}%" for r in best))
+        parts.append("最弱：" + "、".join(f"{r['大分類']}-{r['小分類']}({r['檔數']}檔) {r['平均漲跌幅']:+.2f}%" for r in worst))
+        parts.append("")
     if stock_ranking:
         def fmt_rank(items):
             out = []
@@ -741,7 +786,7 @@ def build_flow_digest():
             chg_str = f"{v['漲跌']:+.1f}%" if v["漲跌"] is not None else "?"
             parts.append(f"{v['name']}({v['code']})：外資{v['外資']:+.1f}億　投信{v['投信']:+.1f}億　({chg_str})")
         parts.append("")
-    if not flow and not sector_inflow and not sector_outflow and not theme_performance and not stock_ranking and not watchlist_flow:
+    if not flow and not sector_inflow and not sector_outflow and not theme_performance and not subcategory_performance and not stock_ranking and not watchlist_flow:
         parts.append("（今天沒有抓到資金流向資料，可能是非交易日或資料尚未公布）")
 
     card_lines = build_recent_cards_section(tw_now)
