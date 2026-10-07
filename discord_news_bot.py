@@ -310,44 +310,57 @@ def fetch_stock_price_lookup():
     return lookup
 
 
+DATA_WARNINGS = []
+
+
+def _get_json_with_retry(url, label, tries=3):
+    """政府開放資料偶爾會「Response ended prematurely」或SSL問題,單次失敗不該讓整個族群
+    漲跌幅默默少掉一批股票,所以重試幾次;全部失敗才放棄並記進DATA_WARNINGS,
+    讓報告上看得到「這份資料缺了」,而不是默默顯示檔數變少的錯誤結果。"""
+    last_err = None
+    for attempt in range(tries):
+        try:
+            try:
+                r = requests.get(url, headers={"Accept": "application/json"}, timeout=20)
+            except requests.exceptions.SSLError:
+                r = requests.get(url, headers={"Accept": "application/json"}, timeout=20, verify=False)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_err = e
+            time.sleep(2 * (attempt + 1))
+    print(f"  {label} fetch failed after {tries} tries: {last_err}")
+    DATA_WARNINGS.append(label)
+    return None
+
+
 def fetch_stock_change_lookup():
     """上市(TWSE)+上櫃(TPEx)全部證券當日漲跌幅(%),免key,用來算自訂概念股族群的
     平均漲跌幅。Change欄位是『今日收盤 - 昨日收盤』的點數(帶正負號),
     除以昨收(=收盤-漲跌)換算成百分比。"""
     lookup = {}
-    try:
-        r = requests.get(STOCK_PRICE_URL, headers={"Accept": "application/json"}, timeout=20)
-        r.raise_for_status()
-        for row in r.json():
-            code = row.get("Code", "").strip()
-            try:
-                close = float(row.get("ClosingPrice"))
-                change = float(row.get("Change"))
-                prev_close = close - change
-                if prev_close > 0:
-                    lookup[code] = change / prev_close * 100
-            except (TypeError, ValueError):
-                continue
-    except Exception as e:
-        print(f"  TWSE stock change lookup fetch failed: {e}")
-    try:
+    twse = _get_json_with_retry(STOCK_PRICE_URL, "上市漲跌幅資料(TWSE)")
+    for row in twse or []:
+        code = row.get("Code", "").strip()
         try:
-            r = requests.get(TPEX_PRICE_URL, headers={"Accept": "application/json"}, timeout=20)
-        except requests.exceptions.SSLError:
-            r = requests.get(TPEX_PRICE_URL, headers={"Accept": "application/json"}, timeout=20, verify=False)
-        r.raise_for_status()
-        for row in r.json():
-            code = row.get("SecuritiesCompanyCode", "").strip()
-            try:
-                close = float(row.get("Close"))
-                change = float(row.get("Change"))
-                prev_close = close - change
-                if prev_close > 0:
-                    lookup[code] = change / prev_close * 100
-            except (TypeError, ValueError):
-                continue
-    except Exception as e:
-        print(f"  TPEx stock change lookup fetch failed: {e}")
+            close = float(row.get("ClosingPrice"))
+            change = float(row.get("Change"))
+            prev_close = close - change
+            if prev_close > 0:
+                lookup[code] = change / prev_close * 100
+        except (TypeError, ValueError):
+            continue
+    tpex = _get_json_with_retry(TPEX_PRICE_URL, "上櫃漲跌幅資料(TPEx)")
+    for row in tpex or []:
+        code = row.get("SecuritiesCompanyCode", "").strip()
+        try:
+            close = float(row.get("Close"))
+            change = float(row.get("Change"))
+            prev_close = close - change
+            if prev_close > 0:
+                lookup[code] = change / prev_close * 100
+        except (TypeError, ValueError):
+            continue
     return lookup
 
 
@@ -747,6 +760,9 @@ def build_flow_digest():
         TW_STOCK_CODES, price_lookup, change_lookup, name_lookup, t86_rows)
 
     parts = [header, ""]
+    if DATA_WARNINGS:
+        parts.append("⚠️ **以下資料今天沒抓到(已重試3次),族群漲跌幅檔數會偏少、結果僅供參考**：" + "、".join(DATA_WARNINGS))
+        parts.append("")
     if flow:
         as_of_fmt = f"{flow['as_of'][:4]}/{flow['as_of'][4:6]}/{flow['as_of'][6:]}" if flow.get("as_of") else "?"
         parts.append(f"💰 **資金方向({as_of_fmt}收盤,三大法人買賣超,億元)**")
