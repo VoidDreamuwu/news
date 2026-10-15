@@ -113,8 +113,24 @@ THEME_GROUPS = {
     "半導體通路": ["3036", "3702"],                            # 文曄/大聯大
     "電池": ["6121", "3211"],                                  # 新普(上櫃)/順達(上櫃)
     "軟體服務": ["6214", "2480", "3029"],                      # 精誠/敦陽科/零壹
+    # 2026下半年AI伺服器拉貨帶出來的兩個主線——2026/10復盤「漏掉最噴的」之後補上的,
+    # 代號都對照官方上市/上櫃公司名單核對過。
+    "CCL/PCB材料": ["6213", "6672", "6278", "8358", "1815"],  # 聯茂/騰輝電子-KY(上市)/台表科/金居(上櫃)/富喬(上櫃)
+    "光通訊/CPO": ["3081", "4977", "4979", "3363", "3163", "3234"],  # 聯亞/眾達-KY/華星光/上詮/波若威/光環(皆上櫃)
 }
 THEME_TOP_N_DISPLAY = 6
+
+# 2026/10使用者自己復盤「7月底換股沒換到最噴的」之後建立——這是個人目前實際持有的
+# 自選股,不是族群分類。用途是在族群動能排行旁邊,直接對照「我手上的股票」跟
+# 「現在最強的族群」動能差多少,把換股決策從憑印象改成看數字。要更新持股請直接改這裡。
+MY_HOLDINGS = {
+    "6531": "愛普",
+    "5347": "世界先進",
+    "6456": "GIS-KY",
+    "1815": "富喬",
+    "3707": "漢磊",
+    "3026": "禾伸堂",
+}
 
 MAX_ITEMS_PER_TICKER = 2
 MAX_TOTAL_ITEMS = 20
@@ -377,6 +393,96 @@ def fetch_theme_group_performance(change_lookup):
         results.append((theme, avg, len(pcts)))
     results.sort(key=lambda x: -x[1])
     return results
+
+
+MOMENTUM_LOOKBACK_DAYS = 20  # 約一個月的交易日,抓「噴出」這種持續好幾週的動能,
+                             # 單日漲跌幅(change_lookup)看不出來——這就是2026/10復盤
+                             # 發現「換股沒換到最噴的」的根本原因:之前只看單日族群漲跌幅,
+                             # 沒有任何東西在追蹤「哪個族群已經連續噴了好幾週」。
+FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
+
+
+def _fetch_momentum_pct(code, lookback_days=MOMENTUM_LOOKBACK_DAYS):
+    """用FinMind(免費、不需key,但有流量限制,所以呼叫方要控制總檔數+間隔)抓
+    單一個股最近約lookback_days個交易日的漲跌幅。回傳None代表抓不到(新股剛上市、
+    FinMind暫時沒資料、或單次請求失敗),呼叫方要能處理這種缺值,不能讓整組計算中斷。"""
+    end_date = datetime.now(timezone(timedelta(hours=8))).date()
+    start_date = end_date - timedelta(days=int(lookback_days * 1.6) + 10)  # 抓寬一點扣掉假日
+    params = {
+        "dataset": "TaiwanStockPrice",
+        "data_id": code,
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+    }
+    try:
+        r = requests.get(FINMIND_URL, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        print(f"  momentum fetch failed for {code}: {e}")
+        return None
+    if data.get("msg") != "success":
+        return None
+    rows = [row for row in data.get("data", []) if row.get("Trading_Volume", 0) > 0 and row.get("close", 0) > 0]
+    if len(rows) < 2:
+        return None
+    rows.sort(key=lambda row: row["date"])
+    window = rows[-lookback_days:] if len(rows) >= lookback_days else rows
+    first_close, last_close = window[0]["close"], window[-1]["close"]
+    if not first_close:
+        return None
+    return (last_close - first_close) / first_close * 100
+
+
+def fetch_momentum_lookup(codes, lookback_days=MOMENTUM_LOOKBACK_DAYS, pause=0.6):
+    """幫一批股票代號(去重後)各抓一次_fetch_momentum_pct,回傳{代號: 漲跌幅%}的字典,
+    抓不到的代號不會出現在字典裡(呼叫方用.get()處理缺值)。呼叫間刻意sleep,
+    避免短時間內大量打FinMind被限流。"""
+    lookup = {}
+    for code in dict.fromkeys(codes):  # 去重但保留原始順序,之後比對FinMind有沒有少抓
+        pct = _fetch_momentum_pct(code, lookback_days)
+        if pct is not None:
+            lookup[code] = pct
+        time.sleep(pause)
+    return lookup
+
+
+def fetch_theme_momentum_ranking(theme_groups, momentum_lookup):
+    """跟fetch_theme_group_performance邏輯一樣(等權重平均),但用
+    MOMENTUM_LOOKBACK_DAYS天的漲跌幅取代單日漲跌幅——這是用來抓「哪個族群正在
+    噴出」的主力指標,單日漲跌幅只會看到當天的噪音。"""
+    results = []
+    for theme, codes in theme_groups.items():
+        pcts = [momentum_lookup[c] for c in codes if c in momentum_lookup]
+        if not pcts:
+            continue
+        avg = sum(pcts) / len(pcts)
+        results.append((theme, avg, len(pcts)))
+    results.sort(key=lambda x: -x[1])
+    return results
+
+
+def build_holdings_vs_strongest_theme(my_holdings, momentum_lookup, theme_momentum, name_lookup=None,
+                                        lag_alert_pct=15.0):
+    """把「我手上的持股」跟「目前最強族群」的20日動能放在一起比,不是只列持股自己的漲跌幅——
+    單獨看持股漲跌幅沒辦法回答「這段期間換股有沒有換對方向」,只有跟當時最強的族群對照,
+    才能看出「雖然持股也在漲,但漲幅遠遠落後最強的賽道」這種2026年7月底發生過的狀況。
+    lag_alert_pct:落後最強族群超過這個百分點,就在報告上標記提醒。"""
+    name_lookup = name_lookup or {}
+    if not theme_momentum:
+        return []
+    strongest_theme, strongest_pct, _ = theme_momentum[0]
+    lines = []
+    for code, fallback_name in my_holdings.items():
+        pct = momentum_lookup.get(code)
+        name = name_lookup.get(code, fallback_name)
+        if pct is None:
+            lines.append((code, name, None, None, None))
+            continue
+        gap = pct - strongest_pct
+        lagging = gap <= -lag_alert_pct
+        lines.append((code, name, pct, gap, lagging))
+    return strongest_theme, strongest_pct, lines
 
 
 INDUSTRY_CLASSIFICATION_FILE = "industry_classification.json"
@@ -759,6 +865,17 @@ def build_flow_digest():
     watchlist_flow = fetch_watchlist_institutional_flow(
         TW_STOCK_CODES, price_lookup, change_lookup, name_lookup, t86_rows)
 
+    # 族群動能(20日)+持股對照——只在17:30這份跑,因為要對每一檔逐一打FinMind,
+    # 比其他單日快照資料重很多;放進新聞報告(07:22/14:07)只會拖慢那兩份的速度。
+    momentum_codes = set()
+    for codes in THEME_GROUPS.values():
+        momentum_codes.update(codes)
+    momentum_codes.update(MY_HOLDINGS.keys())
+    momentum_lookup = fetch_momentum_lookup(momentum_codes)
+    theme_momentum = fetch_theme_momentum_ranking(THEME_GROUPS, momentum_lookup)
+    holdings_comparison = build_holdings_vs_strongest_theme(
+        MY_HOLDINGS, momentum_lookup, theme_momentum, name_lookup)
+
     parts = [header, ""]
     if DATA_WARNINGS:
         parts.append("⚠️ **以下資料今天沒抓到(已重試3次),族群漲跌幅檔數會偏少、結果僅供參考**：" + "、".join(DATA_WARNINGS))
@@ -780,6 +897,21 @@ def build_flow_digest():
         parts.append("📊 **概念股族群漲跌幅(自訂分類,等權重平均,非官方/非市值加權)**")
         for theme, avg, n in theme_performance[:THEME_TOP_N_DISPLAY]:
             parts.append(f"{theme}({n}檔) {avg:+.2f}%")
+        parts.append("")
+    if theme_momentum:
+        parts.append(f"🚀 **族群動能排行({MOMENTUM_LOOKBACK_DAYS}日漲跌幅,抓持續噴出的族群,不是單日噪音)**")
+        for theme, avg, n in theme_momentum:
+            parts.append(f"{theme}({n}檔) {avg:+.1f}%")
+        parts.append("")
+    if holdings_comparison:
+        strongest_theme, strongest_pct, lines = holdings_comparison
+        parts.append(f"🧭 **我的持股 vs 最強族群({strongest_theme} {strongest_pct:+.1f}%)**")
+        for code, name, pct, gap, lagging in lines:
+            if pct is None:
+                parts.append(f"{name}({code})：資料不足,未能計算")
+                continue
+            tag = "⚠️落後" if lagging else ""
+            parts.append(f"{name}({code}) {pct:+.1f}%　差距{gap:+.1f}個百分點 {tag}")
         parts.append("")
     if subcategory_performance:
         parts.append(f"🏭 **產業小分類漲跌幅(依產業分類表,{len(subcategory_performance)}個小分類,等權重平均)**")
