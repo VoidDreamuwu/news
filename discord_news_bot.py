@@ -44,6 +44,8 @@ INSTITUTIONAL_FLOW_URL = "https://www.twse.com.tw/rwd/zh/fund/BFI82U"     # 三�
 STOCK_FLOW_URL = "https://www.twse.com.tw/rwd/zh/fund/T86"                # 個股三大法人買賣超(官方,免key)
 STOCK_PRICE_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"  # 上市個股當日收盤價(官方,免key)
 TPEX_PRICE_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"  # 上櫃個股當日收盤價(官方,免key)
+MARGIN_URL = "https://openapi.twse.com.tw/v1/exchangeReport/MI_MARGN"      # 上市個股融資融券餘額(官方,免key)
+TPEX_MARGIN_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_margin_balance"  # 上櫃個股融資融券餘額(官方,免key)
 TW_TIMEZONE = timezone(timedelta(hours=8))
 
 SECTOR_TOP_N = 5
@@ -375,6 +377,85 @@ def fetch_stock_change_lookup():
         except (TypeError, ValueError):
             continue
     return lookup
+
+
+def fetch_margin_trading_lookup():
+    """上市(TWSE)+上櫃(TPEx)全部證券當日融資融券餘額,免key。兩邊欄位名稱不同
+    (TWSE是中文鍵、TPEx是英文鍵),這裡統一轉成同一組中文鍵,下游(大盤加總/
+    個股明細)才不用分別處理兩種格式。單位是「張」(1000股),不是金額——
+    金額要另外乘現價才能換算,見fetch_market_margin_summary。"""
+    lookup = {}
+    twse = _get_json_with_retry(MARGIN_URL, "上市融資融券資料(TWSE)")
+    for row in twse or []:
+        code = row.get("股票代號", "").strip()
+        if not code:
+            continue
+        today_margin = _parse_twse_number(row.get("融資今日餘額"))
+        prev_margin = _parse_twse_number(row.get("融資前日餘額"))
+        today_short = _parse_twse_number(row.get("融券今日餘額"))
+        prev_short = _parse_twse_number(row.get("融券前日餘額"))
+        lookup[code] = {
+            "融資餘額": today_margin, "融資增減": today_margin - prev_margin,
+            "融券餘額": today_short, "融券增減": today_short - prev_short,
+        }
+    tpex = _get_json_with_retry(TPEX_MARGIN_URL, "上櫃融資融券資料(TPEx)")
+    for row in tpex or []:
+        code = row.get("SecuritiesCompanyCode", "").strip()
+        if not code:
+            continue
+        today_margin = _parse_twse_number(row.get("MarginPurchaseBalance"))
+        prev_margin = _parse_twse_number(row.get("MarginPurchaseBalancePreviousDay"))
+        today_short = _parse_twse_number(row.get("ShortSaleBalance"))
+        prev_short = _parse_twse_number(row.get("ShortSaleBalancePreviousDay"))
+        lookup[code] = {
+            "融資餘額": today_margin, "融資增減": today_margin - prev_margin,
+            "融券餘額": today_short, "融券增減": today_short - prev_short,
+        }
+    return lookup
+
+
+def fetch_market_margin_summary(margin_lookup, price_lookup):
+    """大盤融資融券——把全市場個股的融資/融券餘額(張)直接加總,增減也是當日
+    對前日的加總(等於『今日全市場融資淨增加/減少多少張』,常見的槓桿多空情緒指標)。
+    金額(億元)是用現價估算(張數x1000股x現價),不是官方公布的金額數字,
+    官方只給張數,這裡換算方便你看規模,會跟新聞報的數字有些微落差。"""
+    if not margin_lookup:
+        return None
+    margin_balance = margin_increase = short_balance = short_increase = 0
+    margin_value = short_value = 0.0
+    for code, m in margin_lookup.items():
+        margin_balance += m["融資餘額"]
+        margin_increase += m["融資增減"]
+        short_balance += m["融券餘額"]
+        short_increase += m["融券增減"]
+        price = price_lookup.get(code)
+        if price:
+            margin_value += m["融資餘額"] * 1000 * price
+            short_value += m["融券餘額"] * 1000 * price
+    return {
+        "融資餘額張數": margin_balance, "融資增減張數": margin_increase,
+        "融資金額估算億元": margin_value / 1e8,
+        "融券餘額張數": short_balance, "融券增減張數": short_increase,
+        "融券金額估算億元": short_value / 1e8,
+    }
+
+
+def fetch_watchlist_margin(watchlist, margin_lookup, name_lookup=None):
+    """跟fetch_watchlist_institutional_flow同樣邏輯——watchlist(或MY_HOLDINGS)
+    裡每一檔都列出來,不管漲跌幅或增減有沒有特別大,因為這是『固定追蹤』的
+    清單,不是排行榜。"""
+    name_lookup = name_lookup or {}
+    results = []
+    for code, fallback_name in watchlist.items():
+        m = margin_lookup.get(code)
+        if not m:
+            continue
+        results.append({
+            "code": code, "name": name_lookup.get(code, fallback_name),
+            "融資餘額": m["融資餘額"], "融資增減": m["融資增減"],
+            "融券餘額": m["融券餘額"], "融券增減": m["融券增減"],
+        })
+    return results
 
 
 def fetch_theme_group_performance(change_lookup):
@@ -873,6 +954,11 @@ def build_flow_digest():
     holdings_comparison = build_holdings_vs_strongest_theme(
         MY_HOLDINGS, momentum_lookup, theme_momentum, name_lookup)
 
+    margin_lookup = fetch_margin_trading_lookup()
+    market_margin = fetch_market_margin_summary(margin_lookup, price_lookup)
+    holdings_margin = fetch_watchlist_margin(MY_HOLDINGS, margin_lookup, name_lookup)
+    watchlist_margin = fetch_watchlist_margin(TW_STOCK_CODES, margin_lookup, name_lookup)
+
     parts = [header, ""]
     if DATA_WARNINGS:
         parts.append("⚠️ **以下資料今天沒抓到(已重試3次),族群漲跌幅檔數會偏少、結果僅供參考**：" + "、".join(DATA_WARNINGS))
@@ -909,6 +995,26 @@ def build_flow_digest():
                 continue
             tag = "⚠️落後" if lagging else ""
             parts.append(f"{name}({code}) {pct:+.1f}%　差距{gap:+.1f}個百分點 {tag}")
+        parts.append("")
+    if market_margin:
+        parts.append("💳 **大盤融資融券(全市場加總,張=1000股,金額為現價估算非官方數字)**")
+        parts.append(f"融資餘額 {market_margin['融資餘額張數']:,}張　今日增減 {market_margin['融資增減張數']:+,}張　"
+                      f"估約{market_margin['融資金額估算億元']:.0f}億元")
+        parts.append(f"融券餘額 {market_margin['融券餘額張數']:,}張　今日增減 {market_margin['融券增減張數']:+,}張　"
+                      f"估約{market_margin['融券金額估算億元']:.0f}億元")
+        parts.append("")
+    if holdings_margin:
+        parts.append("💳 **我的持股 融資融券明細(張)**")
+        for m in holdings_margin:
+            parts.append(f"{m['name']}({m['code']})：融資{m['融資餘額']:,}張(增減{m['融資增減']:+,})　"
+                         f"融券{m['融券餘額']:,}張(增減{m['融券增減']:+,})")
+        parts.append("")
+    if watchlist_margin:
+        parts.append("💳 **自選股 融資融券明細(張,依融資增減排序)**")
+        ordered = sorted(watchlist_margin, key=lambda m: -m["融資增減"])
+        for m in ordered:
+            parts.append(f"{m['name']}({m['code']})：融資{m['融資餘額']:,}張(增減{m['融資增減']:+,})　"
+                         f"融券{m['融券餘額']:,}張(增減{m['融券增減']:+,})")
         parts.append("")
     if subcategory_performance:
         parts.append(f"🏭 **產業小分類漲跌幅(依產業分類表,{len(subcategory_performance)}個小分類,等權重平均)**")
