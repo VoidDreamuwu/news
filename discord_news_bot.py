@@ -930,6 +930,12 @@ def build_flow_digest():
     header = f"💰 資金流向報告 | {tw_now.strftime('%Y-%m-%d')} 17:30"
 
     flow = fetch_institutional_flow()
+    # 2026/10使用者回報「感覺資料落後一天」查證屬實——不是這次新增的融資融券抓錢了,
+    # 是證交所/櫃買的官方資料(openapi跟www.twse.com.tw/rwd都一樣)本來就常常在17:30
+    # 這個時間點還停在前一個交易日,報告標題寫「今天」的日期會讓人誤以為是當天盤後數字。
+    # BFI82U(三大法人買賣金額)的回應裡有官方認定的實際資料日期(as_of),用它來判斷
+    # 報告裡其他部分(族群漲跌幅/融資融券等)到底是哪一天的,而不是假設一定是「今天」。
+    as_of_date = flow.get("as_of") if flow else None
     industry_lookup = fetch_stock_industry_lookup()
     price_lookup = fetch_stock_price_lookup()
     name_lookup = fetch_company_name_lookup()
@@ -960,6 +966,14 @@ def build_flow_digest():
     watchlist_margin = fetch_watchlist_margin(TW_STOCK_CODES, margin_lookup, name_lookup)
 
     parts = [header, ""]
+    if as_of_date and as_of_date != tw_now.strftime("%Y%m%d"):
+        as_of_fmt_full = f"{as_of_date[:4]}/{as_of_date[4:6]}/{as_of_date[6:]}"
+        parts.append(f"📅 **注意:證交所資料目前只到 {as_of_fmt_full} 收盤,還沒有今天({tw_now.strftime('%Y/%m/%d')})的——"
+                      f"以下族群漲跌幅/融資融券/資金流向都是上一個交易日的,不是今天盤後**")
+        parts.append("")
+    elif as_of_date:
+        parts.append(f"📅 資料基準日:{as_of_date[:4]}/{as_of_date[4:6]}/{as_of_date[6:]}收盤(跟今天同一天,是最新的)")
+        parts.append("")
     if DATA_WARNINGS:
         parts.append("⚠️ **以下資料今天沒抓到(已重試3次),族群漲跌幅檔數會偏少、結果僅供參考**：" + "、".join(DATA_WARNINGS))
         parts.append("")
