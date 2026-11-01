@@ -458,6 +458,28 @@ def fetch_watchlist_margin(watchlist, margin_lookup, name_lookup=None):
     return results
 
 
+def fetch_margin_ranking(margin_lookup, price_lookup, change_lookup, name_lookup):
+    """全市場個股融資增減排行(張)——跟上面watchlist/MY_HOLDINGS的融資明細不同,
+    這裡不限定在特定股票池,直接從全市場抓融資增減最多/最少的個股,才看得到
+    『自選股清單外,但資金正在大舉進出』的股票(呼應2026/10復盤『換股沒換到
+    最噴的』的教訓——那次漏掉的幾檔當時根本不在自選股池裡)。
+    排序依融資增減『張數』,同一檔股票不同價位的增減規模不直接可比,所以
+    只拿來看『資金正往哪裡去』的方向,不是嚴謹的資金規模比較。"""
+    if not margin_lookup:
+        return [], []
+    rows = []
+    for code, m in margin_lookup.items():
+        price = price_lookup.get(code)
+        if not price:
+            continue                                    # 沒有收盤價(例如當日暫停交易),跳過
+        name = name_lookup.get(code, code)
+        chg = change_lookup.get(code)
+        rows.append((code, name, m["融資餘額"], m["融資增減"], chg))
+    top_increase = sorted(rows, key=lambda x: -x[3])[:STOCK_RANK_TOP_N]
+    top_decrease = sorted(rows, key=lambda x: x[3])[:STOCK_RANK_TOP_N]
+    return top_increase, top_decrease
+
+
 def fetch_theme_group_performance(change_lookup):
     """自訂概念股族群(手動整理,非官方分類,一檔股票可以同時屬於多個族群)的
     當日平均漲跌幅排行——等權重平均,不是市值加權,跟一般股市看盤軟體的
@@ -984,6 +1006,8 @@ def build_flow_digest():
 
     margin_lookup = fetch_margin_trading_lookup()
     market_margin = fetch_market_margin_summary(margin_lookup, price_lookup)
+    margin_rank_up, margin_rank_down = fetch_margin_ranking(
+        margin_lookup, price_lookup, change_lookup, name_lookup)
     holdings_margin = fetch_watchlist_margin(MY_HOLDINGS, margin_lookup, name_lookup)
     watchlist_margin = fetch_watchlist_margin(TW_STOCK_CODES, margin_lookup, name_lookup)
 
@@ -1049,6 +1073,17 @@ def build_flow_digest():
                       f"估約{market_margin['融資金額估算億元']:.0f}億元")
         parts.append(f"融券餘額 {market_margin['融券餘額張數']:,}張　今日增減 {market_margin['融券增減張數']:+,}張　"
                       f"估約{market_margin['融券金額估算億元']:.0f}億元")
+        parts.append("")
+    if margin_rank_up or margin_rank_down:
+        parts.append("💳 **個股融資排名(全市場,依融資增減張數,搭配當日漲跌幅)**")
+        def fmt_margin_rank(items):
+            out = []
+            for code, name, bal, chg_lots, chg_pct in items:
+                pct_str = f"{chg_pct:+.1f}%" if chg_pct is not None else "?"
+                out.append(f"{name}({code}) 融資{chg_lots:+,}張(餘{bal:,}張,漲跌{pct_str})")
+            return "、".join(out) if out else "無"
+        parts.append(f"融資大增：{fmt_margin_rank(margin_rank_up)}")
+        parts.append(f"融資大減：{fmt_margin_rank(margin_rank_down)}")
         parts.append("")
     if holdings_margin:
         parts.append("💳 **我的持股 融資融券明細(張)**")
