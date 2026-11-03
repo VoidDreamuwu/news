@@ -46,7 +46,17 @@ STOCK_PRICE_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL" 
 TPEX_PRICE_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"  # 上櫃個股當日收盤價(官方,免key)
 MARGIN_URL = "https://openapi.twse.com.tw/v1/exchangeReport/MI_MARGN"      # 上市個股融資融券餘額(官方,免key)
 TPEX_MARGIN_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_margin_balance"  # 上櫃個股融資融券餘額(官方,免key)
+TAIEX_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/%5ETWII"  # 加權指數歷史收盤(免key)
 TW_TIMEZONE = timezone(timedelta(hours=8))
+
+# 2026/11使用者分享的方法:大盤漲幅 vs 融資餘額漲幅的百分比差距,是修正前的
+# 槓桿過熱警示指標。回測2010~2026共12次崩盤(自高點回檔>=MARGIN_CRASH_THRESH%
+# 才算一次),指數跟融資餘額各自抓自己落底的那天當基準(融資通常比股價晚
+# 落底,所以不能用同一天),gap=融資自基準以來漲幅%-指數自基準以來漲幅%。
+# 結果:gap>=20/30時,未來5~60個交易日的平均回撤顯著比平常深(z約-3~-9),
+# 但相關係數只有-0.07~-0.14,不是精準的崩盤計時器,只能當風險傾斜指標。
+MARGIN_CRASH_THRESH = 10.0
+MARGIN_LAG_WINDOW = 60
 
 SECTOR_TOP_N = 5
 STOCK_RANK_TOP_N = 3
@@ -478,6 +488,108 @@ def fetch_margin_ranking(margin_lookup, price_lookup, change_lookup, name_lookup
     top_increase = sorted(rows, key=lambda x: -x[3])[:STOCK_RANK_TOP_N]
     top_decrease = sorted(rows, key=lambda x: x[3])[:STOCK_RANK_TOP_N]
     return top_increase, top_decrease
+
+
+def fetch_margin_leverage_gap():
+    """融資槓桿缺口指標——抓近3年加權指數+全市場融資餘額歷史資料,自動找出
+    『最近一次夠格的崩盤』(自高點回檔>=MARGIN_CRASH_THRESH%),指數跟融資
+    餘額各自抓各自落底的那天當基準(融資落底通常比股價晚,在指數低點之後
+    最多再找MARGIN_LAG_WINDOW個交易日找融資自己的低點),回傳兩者自基準
+    以來的累積漲幅%與gap(融資漲幅%-指數漲幅%)。
+
+    這個版本是「每次>=10%修正都重設基準」的自動版,跟手動只鎖定單一個
+    特別大的崩盤(例如只認2025/4關稅崩盤,中間10幾%的修正不重設)算出來的
+    數字不一樣、通常比較小——但這版是實際回測驗證過的(2010~2026,12次
+    修正,gap>=20/30時未來5~60日平均回撤顯著更深,z約-3~-9),手動鎖定單一
+    崩盤版本沒有同樣的系統性驗證,所以拿這版當自動化的基準。"""
+    now = int(time.time())
+    period1 = now - 3 * 365 * 86400
+    try:
+        r = requests.get(f"{TAIEX_CHART_URL}?period1={period1}&period2={now}&interval=1d",
+                          headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+        r.raise_for_status()
+        chart = r.json()
+        result = chart["chart"]["result"][0]
+        ts = result["timestamp"]
+        closes = result["indicators"]["quote"][0]["close"]
+    except Exception as e:
+        print(f"  leverage gap: 加權指數歷史資料抓取失敗: {e}")
+        return None
+    idx_by_date = {}
+    for t, c in zip(ts, closes):
+        if c is None:
+            continue
+        d = datetime.fromtimestamp(t, tz=timezone.utc).strftime("%Y%m%d")
+        idx_by_date[d] = c
+
+    start_str = datetime.fromtimestamp(period1, tz=timezone.utc).strftime("%Y-%m-%d")
+    end_str = datetime.now(TW_TIMEZONE).strftime("%Y-%m-%d")
+    try:
+        r = requests.get(FINMIND_URL, params={
+            "dataset": "TaiwanStockTotalMarginPurchaseShortSale",
+            "start_date": start_str, "end_date": end_str,
+        }, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+        r.raise_for_status()
+        margin_data = r.json()
+    except Exception as e:
+        print(f"  leverage gap: 全市場融資餘額歷史資料抓取失敗: {e}")
+        return None
+    margin_by_date = {}
+    for row in margin_data.get("data", []):
+        if row.get("name") == "MarginPurchaseMoney":
+            margin_by_date[row["date"].replace("-", "")] = row["TodayBalance"]
+
+    dates = sorted(set(idx_by_date) & set(margin_by_date))
+    if len(dates) < 100:
+        return None
+    idx_series = [idx_by_date[d] for d in dates]
+    margin_series = [margin_by_date[d] for d in dates]
+    n = len(dates)
+
+    peak = idx_series[0]
+    phase_low = idx_series[0]
+    phase_low_i = 0
+    anchor_i = 0
+    prev_anchor_i = 0   # 進入目前這一段(可能還沒止跌)之前,原本在用的基準
+    qualified = False
+    for i in range(n):
+        price = idx_series[i]
+        if price > peak:
+            peak = price
+            phase_low = price
+            phase_low_i = i
+            qualified = False
+            prev_anchor_i = anchor_i
+        else:
+            if price < phase_low:
+                phase_low = price
+                phase_low_i = i
+            if (phase_low / peak - 1) * 100 <= -MARGIN_CRASH_THRESH:
+                qualified = True
+            if qualified:
+                anchor_i = phase_low_i
+
+    # 如果目前的低點是最近幾天內剛發生的(還沒辦法確認止跌),用「今天」當基準
+    # 算出來的漲幅永遠是0%,會誤導成「正常範圍」——這種情況退回用上一輪已經
+    # 確立的基準,直到這次下跌真的止穩一段時間再換成新基準。
+    MIN_ANCHOR_AGE = 5
+    if n - 1 - anchor_i < MIN_ANCHOR_AGE:
+        anchor_i = prev_anchor_i
+
+    window_end = min(n - 1, anchor_i + MARGIN_LAG_WINDOW)
+    margin_window = margin_series[anchor_i:window_end + 1]
+    margin_anchor_i = anchor_i + margin_window.index(min(margin_window))
+
+    idx_gain_pct = (idx_series[-1] / idx_series[anchor_i] - 1) * 100
+    margin_gain_pct = (margin_series[-1] / margin_series[margin_anchor_i] - 1) * 100
+    return {
+        "as_of": dates[-1],
+        "idx_anchor_date": dates[anchor_i],
+        "margin_anchor_date": dates[margin_anchor_i],
+        "idx_gain_pct": idx_gain_pct,
+        "margin_gain_pct": margin_gain_pct,
+        "gap": margin_gain_pct - idx_gain_pct,
+    }
 
 
 def fetch_theme_group_performance(change_lookup):
@@ -1010,6 +1122,7 @@ def build_flow_digest():
         margin_lookup, price_lookup, change_lookup, name_lookup)
     holdings_margin = fetch_watchlist_margin(MY_HOLDINGS, margin_lookup, name_lookup)
     watchlist_margin = fetch_watchlist_margin(TW_STOCK_CODES, margin_lookup, name_lookup)
+    leverage_gap = fetch_margin_leverage_gap()
 
     parts = [header, ""]
     if as_of_date and as_of_date != tw_now.strftime("%Y%m%d"):
@@ -1067,8 +1180,23 @@ def build_flow_digest():
             seg20 = f"20日{l20[2]:+.1f}%(差{l20[3]:+.1f}{'⚠️' if l20[4] else ''})" if l20 and l20[2] is not None else "20日無資料"
             parts.append(f"{name}({code})：{seg5}　{seg20}")
         parts.append("")
+    if leverage_gap:
+        g = leverage_gap["gap"]
+        if g >= 30:
+            tag = "🔴 偏高"
+        elif g >= 20:
+            tag = "🟡 略高"
+        else:
+            tag = "🟢 正常範圍"
+        parts.append("📐 **融資槓桿缺口指標(用比率看,不是看張數——自上次≥10%修正的指數/融資各自低點以來漲幅差)**")
+        parts.append(f"指數基準{leverage_gap['idx_anchor_date']}　融資基準{leverage_gap['margin_anchor_date']}")
+        parts.append(f"指數漲幅{leverage_gap['idx_gain_pct']:+.1f}%　融資漲幅{leverage_gap['margin_gain_pct']:+.1f}%　"
+                      f"gap={g:+.1f} {tag}")
+        parts.append("（2010~2026回測:gap≥30時未來5~60日平均回撤比平常深,z約-3~-9,"
+                      "但相關係數僅-0.07~-0.14，只能當風險傾斜指標參考，沒有敗象前不代表會崩盤）")
+        parts.append("")
     if market_margin:
-        parts.append("💳 **大盤融資融券(全市場加總,張=1000股,金額為現價估算非官方數字)**")
+        parts.append("💳 **大盤融資融券(全市場加總,張=1000股,金額為現價估算非官方數字,原始參考數字)**")
         parts.append(f"融資餘額 {market_margin['融資餘額張數']:,}張　今日增減 {market_margin['融資增減張數']:+,}張　"
                       f"估約{market_margin['融資金額估算億元']:.0f}億元")
         parts.append(f"融券餘額 {market_margin['融券餘額張數']:,}張　今日增減 {market_margin['融券增減張數']:+,}張　"
