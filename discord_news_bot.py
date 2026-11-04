@@ -393,11 +393,25 @@ def fetch_stock_change_lookup():
     return lookup
 
 
+def _usage_rate(balance, quota):
+    """使用率(%) = 餘額/限額——TWSE/TPEx都官方公布個股的融資(券)限額(依股本/
+    流通量訂的額度上限,不常變動),這是官方資料裡唯一能算出『比率』的欄位。
+    注意:這不是嚴格定義的『融資維持率』(現在市值/原始融資金額,需要知道
+    當時融資買進成本價,官方資料完全沒有公布這個數字,算不出來)——使用率
+    量的是『這檔股票的融資額度用了多少』,維持率量的是『現在股價距離斷頭
+    還有多少緩衝』,兩者概念不同但都是『比例看風險』,使用率是唯一能從
+    公開資料算出來的版本。"""
+    if not quota:
+        return None
+    return balance / quota * 100
+
+
 def fetch_margin_trading_lookup():
     """上市(TWSE)+上櫃(TPEx)全部證券當日融資融券餘額,免key。兩邊欄位名稱不同
     (TWSE是中文鍵、TPEx是英文鍵),這裡統一轉成同一組中文鍵,下游(大盤加總/
-    個股明細)才不用分別處理兩種格式。單位是「張」(1000股),不是金額——
-    金額要另外乘現價才能換算,見fetch_market_margin_summary。"""
+    個股明細)才不用分別處理兩種格式。餘額/增減單位是「張」(1000股),金額要
+    另外乘現價才能換算,見fetch_market_margin_summary;同時附上官方限額算出
+    的使用率%(見_usage_rate)。"""
     lookup = {}
     twse = _get_json_with_retry(MARGIN_URL, "上市融資融券資料(TWSE)")
     for row in twse or []:
@@ -408,9 +422,14 @@ def fetch_margin_trading_lookup():
         prev_margin = _parse_twse_number(row.get("融資前日餘額"))
         today_short = _parse_twse_number(row.get("融券今日餘額"))
         prev_short = _parse_twse_number(row.get("融券前日餘額"))
+        margin_quota = _parse_twse_number(row.get("融資限額"))
+        short_quota = _parse_twse_number(row.get("融券限額"))
         lookup[code] = {
             "融資餘額": today_margin, "融資增減": today_margin - prev_margin,
             "融券餘額": today_short, "融券增減": today_short - prev_short,
+            "融資限額": margin_quota, "融券限額": short_quota,
+            "融資使用率": _usage_rate(today_margin, margin_quota),
+            "融券使用率": _usage_rate(today_short, short_quota),
         }
     tpex = _get_json_with_retry(TPEX_MARGIN_URL, "上櫃融資融券資料(TPEx)")
     for row in tpex or []:
@@ -421,27 +440,35 @@ def fetch_margin_trading_lookup():
         prev_margin = _parse_twse_number(row.get("MarginPurchaseBalancePreviousDay"))
         today_short = _parse_twse_number(row.get("ShortSaleBalance"))
         prev_short = _parse_twse_number(row.get("ShortSaleBalancePreviousDay"))
+        margin_quota = _parse_twse_number(row.get("MarginPurchaseQuota"))
+        short_quota = _parse_twse_number(row.get("ShortSaleQuota"))
         lookup[code] = {
             "融資餘額": today_margin, "融資增減": today_margin - prev_margin,
             "融券餘額": today_short, "融券增減": today_short - prev_short,
+            "融資限額": margin_quota, "融券限額": short_quota,
+            "融資使用率": _usage_rate(today_margin, margin_quota),
+            "融券使用率": _usage_rate(today_short, short_quota),
         }
     return lookup
 
 
 def fetch_market_margin_summary(margin_lookup, price_lookup):
-    """大盤融資融券——把全市場個股的融資/融券餘額(張)直接加總,增減也是當日
-    對前日的加總(等於『今日全市場融資淨增加/減少多少張』,常見的槓桿多空情緒指標)。
-    金額(億元)是用現價估算(張數x1000股x現價),不是官方公布的金額數字,
-    官方只給張數,這裡換算方便你看規模,會跟新聞報的數字有些微落差。"""
+    """大盤融資融券——主要指標是全市場使用率%(=Σ餘額/Σ限額,官方限額資料算出來
+    的比率,見_usage_rate),比直接看張數更能反映『現在有多緊繃』,不會因為
+    上市股票數變多/股本變大而失真。張數/金額估算(張數x1000股x現價,非官方
+    金額數字)留著當規模參考,放在回傳值裡但顯示時退居第二。"""
     if not margin_lookup:
         return None
     margin_balance = margin_increase = short_balance = short_increase = 0
+    margin_quota_sum = short_quota_sum = 0
     margin_value = short_value = 0.0
     for code, m in margin_lookup.items():
         margin_balance += m["融資餘額"]
         margin_increase += m["融資增減"]
         short_balance += m["融券餘額"]
         short_increase += m["融券增減"]
+        margin_quota_sum += m["融資限額"] or 0
+        short_quota_sum += m["融券限額"] or 0
         price = price_lookup.get(code)
         if price:
             margin_value += m["融資餘額"] * 1000 * price
@@ -451,6 +478,10 @@ def fetch_market_margin_summary(margin_lookup, price_lookup):
         "融資金額估算億元": margin_value / 1e8,
         "融券餘額張數": short_balance, "融券增減張數": short_increase,
         "融券金額估算億元": short_value / 1e8,
+        "融資使用率": _usage_rate(margin_balance, margin_quota_sum),
+        "融資使用率今日增減": _usage_rate(margin_increase, margin_quota_sum),
+        "融券使用率": _usage_rate(short_balance, short_quota_sum),
+        "融券使用率今日增減": _usage_rate(short_increase, short_quota_sum),
     }
 
 
@@ -468,6 +499,7 @@ def fetch_watchlist_margin(watchlist, margin_lookup, name_lookup=None):
             "code": code, "name": name_lookup.get(code, fallback_name),
             "融資餘額": m["融資餘額"], "融資增減": m["融資增減"],
             "融券餘額": m["融券餘額"], "融券增減": m["融券增減"],
+            "融資使用率": m["融資使用率"], "融券使用率": m["融券使用率"],
         })
     return results
 
@@ -488,10 +520,28 @@ def fetch_margin_ranking(margin_lookup, price_lookup, change_lookup, name_lookup
             continue                                    # 沒有收盤價(例如當日暫停交易),跳過
         name = name_lookup.get(code, code)
         chg = change_lookup.get(code)
-        rows.append((code, name, m["融資餘額"], m["融資增減"], chg))
+        rows.append((code, name, m["融資餘額"], m["融資增減"], chg, m["融資使用率"]))
     top_increase = sorted(rows, key=lambda x: -x[3])[:STOCK_RANK_TOP_N]
     top_decrease = sorted(rows, key=lambda x: x[3])[:STOCK_RANK_TOP_N]
     return top_increase, top_decrease
+
+
+def fetch_margin_usage_ranking(margin_lookup, price_lookup, name_lookup):
+    """全市場個股融資使用率排行(餘額/官方限額,見_usage_rate)——跟上面
+    fetch_margin_ranking(看資金流向,今天增減最多)是不同角度:這裡看『已經
+    用掉多少額度』,使用率越接近100%代表這檔股票的融資空間越小,追高的人
+    越多但後面能再加碼融資的餘裕越少,算是個股層級的槓桿壓力指標。"""
+    if not margin_lookup:
+        return []
+    rows = []
+    for code, m in margin_lookup.items():
+        if not price_lookup.get(code):
+            continue
+        usage = m["融資使用率"]
+        if usage is None:
+            continue
+        rows.append((code, name_lookup.get(code, code), m["融資餘額"], usage))
+    return sorted(rows, key=lambda x: -x[3])[:STOCK_RANK_TOP_N]
 
 
 def fetch_margin_leverage_gap():
@@ -504,7 +554,14 @@ def fetch_margin_leverage_gap():
     這個基準會一直沿用,中間發生的10幾%小修正(例如2026/2、2026/6、2026/10
     的幾次回檔)都不會重設,只有再出現一次>=MARGIN_CRASH_THRESH%的同等級
     大崩盤才會換成新基準——回測2010~2026在這個門檻下共抓到5次大崩盤,
-    gap>=20/30時未來5~60日平均回撤顯著更深(z約-5~-14)。"""
+    gap>=20/30時未來5~60日平均回撤顯著更深(z約-5~-14)。
+
+    指數基準的『值』用那天的盤中低點(low),不是收盤價——用收盤價算出來的
+    gap會比坊間常見的算法(用當天盤中最低點當崩盤基準)小好幾個百分點,因為
+    崩盤當天通常會從低點反彈收高。哪一天是基準『日』還是看收盤價序列判斷
+    (找出高點回檔幅度達門檻的那一段的最低收盤日),只是找到那天之後,改抓
+    low而不是close當基準值,才會跟手動對照歷史低點(例如2025/4/9盤中低點
+    17306點)算出來的數字一致。"""
     now = int(time.time())
     period1 = now - 3 * 365 * 86400
     try:
@@ -514,16 +571,21 @@ def fetch_margin_leverage_gap():
         chart = r.json()
         result = chart["chart"]["result"][0]
         ts = result["timestamp"]
-        closes = result["indicators"]["quote"][0]["close"]
+        quote = result["indicators"]["quote"][0]
+        closes = quote["close"]
+        lows = quote["low"]
     except Exception as e:
         print(f"  leverage gap: 加權指數歷史資料抓取失敗: {e}")
         return None
     idx_by_date = {}
-    for t, c in zip(ts, closes):
+    low_by_date = {}
+    for t, c, lo in zip(ts, closes, lows):
         if c is None:
             continue
         d = datetime.fromtimestamp(t, tz=timezone.utc).strftime("%Y%m%d")
         idx_by_date[d] = c
+        if lo is not None:
+            low_by_date[d] = lo
 
     start_str = datetime.fromtimestamp(period1, tz=timezone.utc).strftime("%Y-%m-%d")
     end_str = datetime.now(TW_TIMEZONE).strftime("%Y-%m-%d")
@@ -583,7 +645,9 @@ def fetch_margin_leverage_gap():
     margin_window = margin_series[anchor_i:window_end + 1]
     margin_anchor_i = anchor_i + margin_window.index(min(margin_window))
 
-    idx_gain_pct = (idx_series[-1] / idx_series[anchor_i] - 1) * 100
+    # 基準日定了之後,改用那天的盤中低點當基準『值』(查不到low才退回收盤價)
+    idx_anchor_value = low_by_date.get(dates[anchor_i], idx_series[anchor_i])
+    idx_gain_pct = (idx_series[-1] / idx_anchor_value - 1) * 100
     margin_gain_pct = (margin_series[-1] / margin_series[margin_anchor_i] - 1) * 100
     return {
         "as_of": dates[-1],
@@ -1123,6 +1187,7 @@ def build_flow_digest():
     market_margin = fetch_market_margin_summary(margin_lookup, price_lookup)
     margin_rank_up, margin_rank_down = fetch_margin_ranking(
         margin_lookup, price_lookup, change_lookup, name_lookup)
+    margin_usage_rank = fetch_margin_usage_ranking(margin_lookup, price_lookup, name_lookup)
     holdings_margin = fetch_watchlist_margin(MY_HOLDINGS, margin_lookup, name_lookup)
     watchlist_margin = fetch_watchlist_margin(TW_STOCK_CODES, margin_lookup, name_lookup)
     leverage_gap = fetch_margin_leverage_gap()
@@ -1199,35 +1264,49 @@ def build_flow_digest():
                       "但相關係數仍僅-0.09~-0.16左右，只能當風險傾斜指標參考，沒有敗象前不代表會崩盤）")
         parts.append("")
     if market_margin:
-        parts.append("💳 **大盤融資融券(全市場加總,張=1000股,金額為現價估算非官方數字,原始參考數字)**")
-        parts.append(f"融資餘額 {market_margin['融資餘額張數']:,}張　今日增減 {market_margin['融資增減張數']:+,}張　"
-                      f"估約{market_margin['融資金額估算億元']:.0f}億元")
-        parts.append(f"融券餘額 {market_margin['融券餘額張數']:,}張　今日增減 {market_margin['融券增減張數']:+,}張　"
-                      f"估約{market_margin['融券金額估算億元']:.0f}億元")
+        parts.append("💳 **大盤融資融券(用使用率=餘額/官方限額看,不是直接看張數)**")
+        def fmt_usage_line(label, rate, rate_chg, bal, chg_lots):
+            rate_str = f"{rate:.1f}%" if rate is not None else "?"
+            chg_str = f"{rate_chg:+.2f}pp" if rate_chg is not None else "?"
+            return f"{label}使用率 {rate_str}(今日{chg_str})　(餘{bal:,}張,增減{chg_lots:+,}張)"
+        parts.append(fmt_usage_line("融資", market_margin["融資使用率"], market_margin["融資使用率今日增減"],
+                                     market_margin["融資餘額張數"], market_margin["融資增減張數"]))
+        parts.append(fmt_usage_line("融券", market_margin["融券使用率"], market_margin["融券使用率今日增減"],
+                                     market_margin["融券餘額張數"], market_margin["融券增減張數"]))
+        parts.append("")
+    if margin_usage_rank:
+        parts.append("💳 **個股融資使用率排名(全市場,餘額/官方限額,越接近100%代表這檔融資空間越小)**")
+        out = [f"{name}({code}) {usage:.0f}%(餘{bal:,}張)" for code, name, bal, usage in margin_usage_rank]
+        parts.append("、".join(out))
         parts.append("")
     if margin_rank_up or margin_rank_down:
-        parts.append("💳 **個股融資排名(全市場,依融資增減張數,搭配當日漲跌幅)**")
+        parts.append("💳 **個股融資增減排名(全市場,依融資增減張數看資金流向,搭配當日漲跌幅)**")
         def fmt_margin_rank(items):
             out = []
-            for code, name, bal, chg_lots, chg_pct in items:
+            for code, name, bal, chg_lots, chg_pct, usage in items:
                 pct_str = f"{chg_pct:+.1f}%" if chg_pct is not None else "?"
-                out.append(f"{name}({code}) 融資{chg_lots:+,}張(餘{bal:,}張,漲跌{pct_str})")
+                usage_str = f"{usage:.0f}%" if usage is not None else "?"
+                out.append(f"{name}({code}) 融資{chg_lots:+,}張(使用率{usage_str},漲跌{pct_str})")
             return "、".join(out) if out else "無"
         parts.append(f"融資大增：{fmt_margin_rank(margin_rank_up)}")
         parts.append(f"融資大減：{fmt_margin_rank(margin_rank_down)}")
         parts.append("")
     if holdings_margin:
-        parts.append("💳 **我的持股 融資融券明細(張)**")
+        parts.append("💳 **我的持股 融資融券使用率(餘額/官方限額)**")
         for m in holdings_margin:
-            parts.append(f"{m['name']}({m['code']})：融資{m['融資餘額']:,}張(增減{m['融資增減']:+,})　"
-                         f"融券{m['融券餘額']:,}張(增減{m['融券增減']:+,})")
+            margin_usage_str = f"{m['融資使用率']:.0f}%" if m["融資使用率"] is not None else "?"
+            short_usage_str = f"{m['融券使用率']:.0f}%" if m["融券使用率"] is not None else "?"
+            parts.append(f"{m['name']}({m['code']})：融資使用率{margin_usage_str}(餘{m['融資餘額']:,}張,增減{m['融資增減']:+,})　"
+                         f"融券使用率{short_usage_str}(餘{m['融券餘額']:,}張,增減{m['融券增減']:+,})")
         parts.append("")
     if watchlist_margin:
-        parts.append("💳 **自選股 融資融券明細(張,依融資增減排序)**")
-        ordered = sorted(watchlist_margin, key=lambda m: -m["融資增減"])
+        parts.append("💳 **自選股 融資融券使用率(餘額/官方限額,依使用率排序)**")
+        ordered = sorted(watchlist_margin, key=lambda m: -(m["融資使用率"] or -1))
         for m in ordered:
-            parts.append(f"{m['name']}({m['code']})：融資{m['融資餘額']:,}張(增減{m['融資增減']:+,})　"
-                         f"融券{m['融券餘額']:,}張(增減{m['融券增減']:+,})")
+            margin_usage_str = f"{m['融資使用率']:.0f}%" if m["融資使用率"] is not None else "?"
+            short_usage_str = f"{m['融券使用率']:.0f}%" if m["融券使用率"] is not None else "?"
+            parts.append(f"{m['name']}({m['code']})：融資使用率{margin_usage_str}(餘{m['融資餘額']:,}張,增減{m['融資增減']:+,})　"
+                         f"融券使用率{short_usage_str}(餘{m['融券餘額']:,}張,增減{m['融券增減']:+,})")
         parts.append("")
     if subcategory_performance:
         parts.append(f"🏭 **產業小分類漲跌幅(依產業分類表,{len(subcategory_performance)}個小分類,等權重平均)**")
