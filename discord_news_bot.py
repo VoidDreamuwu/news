@@ -47,7 +47,25 @@ TPEX_PRICE_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_
 MARGIN_URL = "https://openapi.twse.com.tw/v1/exchangeReport/MI_MARGN"      # 上市個股融資融券餘額(官方,免key)
 TPEX_MARGIN_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_margin_balance"  # 上櫃個股融資融券餘額(官方,免key)
 TAIEX_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/%5ETWII"  # 加權指數歷史收盤(免key)
+SSF_LISTS_URL = "https://openapi.taifex.com.tw/v1/SSFLists"  # 股票期貨交易標的清單(期交所,免key)
 TW_TIMEZONE = timezone(timedelta(hours=8))
+
+# 2026/11使用者構想的當沖策略,已用2020~2026、watchlist裡有股票期貨的26檔
+# 回測驗證過:「大盤開高,放空近GAP_FADE_STRENGTH_WINDOW日比大盤弱很多的
+# 股票;開低,做多比大盤強很多的股票」,進場價=當天開盤、出場價=當天收盤。
+# 一開始用「分強弱三等分」測,幾乎沒有額外效果(跟不分強弱、全市場做幾乎
+# 打平);後來改成看「相對強度差距的絕對大小」,發現差距越大訊號越準,
+# U型分布兩端都有效但只有「方向正確(弱股放空/強股做多)」那端在扣成本後
+# 還留得住顯著的正報酬。掃過不同門檻,GAP_FADE_SCORE_THRESH=8(%)是
+# 「訊號還夠準、又不會稀少到幾乎沒機會進場」的甜蜜點:毛利約+0.23%/天
+# (z約2.5),改用股票期貨(期交稅僅10萬分之2,比現股當沖證交稅0.15%低很多)
+# 執行、扣掉期交稅+手續費估計後淨利約+0.18%/天。回測只涵蓋26檔科技股
+# watchlist、2020~2026多頭居多的區間,不是保證獲利,詳細回測方法論與
+# 對照組結果已經在對話記錄裡,這裡的門檻跟GAP_FADE_STRENGTH_WINDOW都是
+# 照那次回測的結論設的。
+GAP_FADE_GAP_THRESH = 0.2        # 大盤開盤跳空門檻(%),太小的跳空不算訊號
+GAP_FADE_STRENGTH_WINDOW = 5     # 相對強度回看幾個交易日
+GAP_FADE_SCORE_THRESH = 8.0      # 相對強度差距門檻(%),回測掃過門檻後選的甜蜜點
 
 # 2026/11使用者分享的方法:大盤漲幅 vs 融資餘額漲幅的百分比差距,是修正前的
 # 槓桿過熱警示指標。用MARGIN_CRASH_THRESH=25%當「同等級大崩盤」的門檻,
@@ -756,6 +774,141 @@ def fetch_theme_momentum_ranking(theme_groups, momentum_lookup):
     return results
 
 
+def fetch_gap_fade_universe(codes):
+    """從候選代號裡,篩出「有股票期貨」的那些(期交所SSFLists是全市場326檔
+    股票期貨標的清單,免key)。只有在這個子集合裡找訊號,是因為股票期貨當沖
+    成本(期交稅10萬分之2)遠低於現股當沖(證交稅0.15%),回測顯示現股當沖
+    版本的毛利扛不住成本,股票期貨版本才留得住淨利。"""
+    try:
+        r = requests.get(SSF_LISTS_URL, timeout=20)
+        r.raise_for_status()
+        ssf_codes = {item["StockCode"] for item in r.json()}
+    except Exception as e:
+        print(f"  gap fade: 股票期貨清單抓取失敗: {e}")
+        return set()
+    return {code for code in codes if code in ssf_codes}
+
+
+def _rel_strength_asof_yesterday(code, today_iso, window):
+    """算某股票『以昨收為終點』回看window個交易日的報酬%,嚴格排除今天的
+    資料(即使FinMind已經有今天的收盤,也不用,避免訊號偷看到今天才知道
+    的資訊)。回傳None代表資料不足。"""
+    rows = _fetch_momentum_history(code, window + 5)
+    if not rows:
+        return None
+    rows = [row for row in rows if row["date"] < today_iso]
+    if len(rows) < window + 1:
+        return None
+    c0, c1 = rows[-(window + 1)]["close"], rows[-1]["close"]
+    if not c0:
+        return None
+    return (c1 / c0 - 1) * 100
+
+
+def fetch_gap_fade_signal(watchlist_codes, name_lookup=None):
+    """回測驗證過的「大盤開高空弱勢/開低多強勢」股票期貨當沖訊號,見上面
+    GAP_FADE_*常數旁的回測結論註解。
+
+    這是『收盤後』算出來的訊號——大盤的開盤跳空、個股的相對強度都是用
+    『今天』這個已經走完的交易日資料算的,不是明天盤前的預測。放在這份
+    收盤後才發送的報告裡看,等於是『驗收今天這個訊號準不準』,不是給你
+    明天開盤進場用的即時警示;真的要盤中進場,需要另外排一個開盤後幾分鐘
+    跑的排程,目前沒有做。
+
+    回傳None代表資料抓取失敗;回傳dict但picks為空代表『今天沒有訊號』
+    (跳空不夠大,或沒有股票的差距超過門檻)。"""
+    name_lookup = name_lookup or {}
+    universe = fetch_gap_fade_universe(watchlist_codes)
+    if not universe:
+        return None
+
+    # 先抓個股今日行情,用STOCK_DAY_ALL自己回報的日期當『今天』的基準——不能假設
+    # 現在的日曆日期=TWSE最新資料的日期,證交所常常傍晚這個時間點都還停在前一個
+    # 交易日(build_flow_digest()開頭的as_of_date註解講的就是這個問題),如果拿
+    # Yahoo加權指數的『最新一筆』硬配TWSE可能落後一天的個股資料,會把不同天的
+    # 開盤/收盤混在一起算出離譜的報酬。
+    try:
+        r = requests.get(STOCK_PRICE_URL, headers={"Accept": "application/json"}, timeout=20)
+        r.raise_for_status()
+        today_ohlc = {row.get("Code", "").strip(): row for row in r.json()}
+    except Exception as e:
+        print(f"  gap fade: 個股今日行情抓取失敗: {e}")
+        return None
+    raw_date = next((row.get("Date") for row in today_ohlc.values() if row.get("Date")), None)
+    if not raw_date or len(raw_date) < 7:
+        return None
+    today_d = f"{int(raw_date[:-4]) + 1911}-{raw_date[-4:-2]}-{raw_date[-2:]}"  # 民國轉西元
+
+    now = int(time.time())
+    period1 = now - 30 * 86400  # 抓最近30天,夠算5日相對強度+留緩衝
+    try:
+        r = requests.get(f"{TAIEX_CHART_URL}?period1={period1}&period2={now}&interval=1d",
+                          headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+        r.raise_for_status()
+        chart = r.json()["chart"]["result"][0]
+        ts = chart["timestamp"]
+        quote = chart["indicators"]["quote"][0]
+        opens, closes = quote["open"], quote["close"]
+    except Exception as e:
+        print(f"  gap fade: 加權指數資料抓取失敗: {e}")
+        return None
+
+    taiex_by_date = {}
+    for t, o, c in zip(ts, opens, closes):
+        if o is None or c is None:
+            continue
+        d = datetime.fromtimestamp(t, tz=timezone.utc).strftime("%Y-%m-%d")
+        taiex_by_date[d] = {"open": o, "close": c}
+    taiex_dates = sorted(taiex_by_date)
+    if today_d not in taiex_by_date:
+        print(f"  gap fade: 加權指數資料還沒有{today_d}這天,跳過")
+        return None
+    today_i = taiex_dates.index(today_d)
+    if today_i < 1:
+        return None
+    yday_d = taiex_dates[today_i - 1]
+
+    gap_pct = (taiex_by_date[today_d]["open"] / taiex_by_date[yday_d]["close"] - 1) * 100
+    result = {"as_of": today_d, "gap_pct": gap_pct, "is_gap_up": None, "picks": []}
+    if abs(gap_pct) < GAP_FADE_GAP_THRESH:
+        return result
+    is_gap_up = gap_pct > 0
+    result["is_gap_up"] = is_gap_up
+
+    anchor_i = today_i - 1 - GAP_FADE_STRENGTH_WINDOW
+    if anchor_i < 0:
+        return result
+    mkt_ret = (taiex_by_date[yday_d]["close"] / taiex_by_date[taiex_dates[anchor_i]]["close"] - 1) * 100
+
+    for code in universe:
+        row = today_ohlc.get(code)
+        if not row:
+            continue
+        try:
+            today_open, today_close = float(row["OpeningPrice"]), float(row["ClosingPrice"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if not today_open:
+            continue
+        s_ret = _rel_strength_asof_yesterday(code, today_d, GAP_FADE_STRENGTH_WINDOW)
+        if s_ret is None:
+            continue
+        rel_str = s_ret - mkt_ret
+        score = -rel_str if is_gap_up else rel_str
+        if score < GAP_FADE_SCORE_THRESH:
+            continue
+        oc_ret = (today_close / today_open - 1) * 100
+        trade_ret = -oc_ret if is_gap_up else oc_ret
+        result["picks"].append({
+            "code": code, "name": name_lookup.get(code, code),
+            "rel_gap": score, "trade_ret": trade_ret,
+        })
+        time.sleep(0.4)  # FinMind流量控制
+
+    result["picks"].sort(key=lambda x: -x["rel_gap"])
+    return result
+
+
 def build_holdings_vs_strongest_theme(my_holdings, momentum_lookup, theme_momentum, name_lookup=None,
                                         lag_alert_pct=15.0):
     """把「我手上的持股」跟「目前最強族群」的20日動能放在一起比,不是只列持股自己的漲跌幅——
@@ -1191,6 +1344,7 @@ def build_flow_digest():
     holdings_margin = fetch_watchlist_margin(MY_HOLDINGS, margin_lookup, name_lookup)
     watchlist_margin = fetch_watchlist_margin(TW_STOCK_CODES, margin_lookup, name_lookup)
     leverage_gap = fetch_margin_leverage_gap()
+    gap_fade = fetch_gap_fade_signal(TW_STOCK_CODES, name_lookup)
 
     parts = [header, ""]
     if as_of_date and as_of_date != tw_now.strftime("%Y%m%d"):
@@ -1262,6 +1416,27 @@ def build_flow_digest():
                       f"gap={g:+.1f} {tag}")
         parts.append("（2010~2026回測,≥25%門檻共5次大崩盤:gap≥30時未來5~60日平均回撤比平常深,z約-6~-14,"
                       "但相關係數仍僅-0.09~-0.16左右，只能當風險傾斜指標參考，沒有敗象前不代表會崩盤）")
+        parts.append("")
+    if gap_fade:
+        if gap_fade["is_gap_up"] is None:
+            direction_desc = "平" + f"{gap_fade['gap_pct']:+.2f}%(未達{GAP_FADE_GAP_THRESH:.1f}%門檻)"
+        else:
+            direction_desc = (f"{'高' if gap_fade['is_gap_up'] else '低'}{gap_fade['gap_pct']:+.2f}%，"
+                               f"{'放空' if gap_fade['is_gap_up'] else '做多'}相對大盤差距≥{GAP_FADE_SCORE_THRESH:.0f}%的"
+                               f"{'弱勢' if gap_fade['is_gap_up'] else '強勢'}股(限有股票期貨的watchlist成分股)")
+        parts.append(f"🎯 **開盤跳空當沖訊號(股票期貨,{gap_fade['as_of']})——大盤開{direction_desc}**")
+        if abs(gap_fade["gap_pct"]) < GAP_FADE_GAP_THRESH:
+            parts.append("今天跳空不夠大,沒有訊號。")
+        elif not gap_fade["picks"]:
+            parts.append("今天有跳空,但沒有股票的相對強度差距超過門檻,沒有訊號。")
+        else:
+            action = "放空" if gap_fade["is_gap_up"] else "做多"
+            for pk in gap_fade["picks"]:
+                parts.append(f"{pk['name']}({pk['code']})：差距{pk['rel_gap']:+.1f}%　"
+                              f"今天{action}若照這訊號進出,open→close報酬約{pk['trade_ret']:+.2f}%(未扣成本)")
+        parts.append("（2020~2026回測,26檔有股票期貨的watchlist成分股:差距≥8%時毛利約+0.23%/天(z≈2.5),"
+                      "改用股票期貨執行扣成本後淨利約+0.18%/天——這是收盤後才算出來驗收今天訊號準不準,"
+                      "不是盤前預測,也不是保證獲利，回測區間多頭居多，自行確認期貨商費率與限制後再決定要不要跟）")
         parts.append("")
     if market_margin:
         parts.append("💳 **大盤融資融券(用使用率=餘額/官方限額看,不是直接看張數)**")
