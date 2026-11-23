@@ -48,6 +48,14 @@ MARGIN_URL = "https://openapi.twse.com.tw/v1/exchangeReport/MI_MARGN"      # 上
 TPEX_MARGIN_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_margin_balance"  # 上櫃個股融資融券餘額(官方,免key)
 TAIEX_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/%5ETWII"  # 加權指數歷史收盤(免key)
 SSF_LISTS_URL = "https://openapi.taifex.com.tw/v1/SSFLists"  # 股票期貨交易標的清單(期交所,免key)
+FUT_DAILY_URL = "https://openapi.taifex.com.tw/v1/DailyMarketReportFut"  # 期貨每日交易行情(各契約各月份,含盤後)
+# ↑ OpenAPI要到隔天清晨約06:30才更新,17:37的報告永遠會落後一天;官網的每日行情下載
+#   (同樣的欄位,CSV/Big5)收盤後當天就有,所以以官網為主、OpenAPI當備援。
+FUT_DAILY_CSV_URL = "https://www.taifex.com.tw/cht/3/futDataDown"
+SSF_MARGIN_URL = "https://openapi.taifex.com.tw/v1/SingleStockFuturesMargining"  # 股票期貨契約名稱(用來辨識「小型」契約)
+SSF_ADJUSTED_URL = "https://openapi.taifex.com.tw/v1/SSFAdjustedInfo"  # 除權息後調整型契約(每口股數不是2000)
+SSF_VALUE_TOP_N = 20
+SSF_VALUE_EXCLUDE = {"2330"}  # 台積電期貨成交值長期遠大於其他檔,排名時拿掉,看其他股票的資金熱度
 TW_TIMEZONE = timezone(timedelta(hours=8))
 
 # 2026/11使用者構想的當沖策略,已用2020~2026、watchlist裡有股票期貨的26檔
@@ -909,6 +917,114 @@ def fetch_gap_fade_signal(watchlist_codes, name_lookup=None):
     return result
 
 
+def _fetch_fut_daily_rows():
+    """期貨每日行情(全部契約、各月份、一般+盤後),統一成dict list。
+    先抓官網CSV(今天往回找最多7天,遇到假日/還沒公布就往前一天),失敗再用OpenAPI。"""
+    tw_today = datetime.now(TW_TIMEZONE).date()
+    for back in range(8):
+        d = (tw_today - timedelta(days=back)).strftime("%Y/%m/%d")
+        try:
+            r = requests.post(FUT_DAILY_CSV_URL, data={
+                "down_type": "1", "commodity_id": "all", "commodity_id2": "",
+                "queryStartDate": d, "queryEndDate": d}, timeout=30)
+            r.raise_for_status()
+            text = r.content.decode("big5", errors="replace")
+        except Exception as e:
+            print(f"  期貨每日行情(官網)抓取失敗 {d}: {e}")
+            break
+        rows = []
+        for line in text.splitlines()[1:]:
+            f = [x.strip() for x in line.split(",")]
+            if len(f) < 18 or not f[0][:4].isdigit():
+                continue
+            rows.append({"Date": f[0].replace("/", ""), "Contract": f[1], "ContractMonth(Week)": f[2],
+                         "High": f[4], "Low": f[5], "Last": f[6], "%": f[8], "Volume": f[9],
+                         "TradingSession": f[17]})
+        if rows:
+            return rows
+    try:
+        return requests.get(FUT_DAILY_URL, timeout=30).json()
+    except Exception as e:
+        print(f"  期貨每日行情(OpenAPI)抓取失敗: {e}")
+        return None
+
+
+def fetch_ssf_value_ranking(name_lookup=None, top_n=SSF_VALUE_TOP_N):
+    """股票期貨每日『成交值』排名(依每檔股票當天期貨成交的金額,不是口數)。
+
+    只排個股:指數期貨(大盤 TX/MTX/TMF…)本來就不在股票期貨清單裡,ETF期貨(0050/0056等)
+    也排除。同一檔股票的標準型(1口=2000股)+小型(1口=100股)+除權息調整型契約、
+    所有月份、一般+盤後時段全部加總。
+
+    成交值 = Σ 口數 × 每口股數 × 價格。期交所沒有公布各契約的成交金額,價格用每列
+    (契約×月份×時段)的(最高+最低+最後成交價)/3 估算,跟實際成交均價會有些微差距。
+    價差單(月份欄有'/')不算,避免跟單月份重複計算。
+
+    漲跌幅用「期貨本身」一般盤成交最多那個月份的漲跌%,不用現股漲跌——期貨行情跟證交所
+    現股資料常常不是同一天更新,拿不同天的數字配在一起會誤導。
+
+    回傳 {"date": "YYYYMMDD", "items": [(code, name, 億元, 口數, 期貨漲跌%字串)]},失敗回傳None。"""
+    name_lookup = name_lookup or {}
+    try:
+        ssf = requests.get(SSF_LISTS_URL, timeout=20).json()
+        margin = requests.get(SSF_MARGIN_URL, timeout=20).json()
+    except Exception as e:
+        print(f"  股票期貨成交值: 期交所資料抓取失敗: {e}")
+        return None
+    rows = _fetch_fut_daily_rows()
+    if not rows:
+        return None
+    try:
+        adjusted = requests.get(SSF_ADJUSTED_URL, timeout=20).json()
+    except Exception as e:
+        print(f"  股票期貨成交值: 調整型契約清單抓取失敗(只影響少數除權息契約): {e}")
+        adjusted = []
+
+    mini = {m["Contract"] for m in margin if str(m.get("ContractName", "")).startswith("小型")}
+    contract_info = {}   # 契約代號 → (股票代號, 股票名稱, 每口股數)
+    for x in ssf:
+        if "ETF" in x.get("Type", "") or not x.get("Type"):   # ETF(含0050)、債券ETF 不排
+            continue
+        contract_info[x["Contract"]] = (x["StockCode"], x.get("StockName", ""), 100 if x["Contract"] in mini else 2000)
+    for x in adjusted:
+        if x.get("Futures/Options") != "股票期貨" or "ETF" in x.get("TWSEStock/TPExStock/TWSEETF", ""):
+            continue
+        try:
+            contract_info[x["Contract"]] = (x["StockCode"], x.get("ContractName", ""),
+                                            float(x["UnderlyingSecurityShares"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    agg, dates = {}, set()
+    for r in rows:
+        info = contract_info.get(r.get("Contract"))
+        if not info or "/" in r.get("ContractMonth(Week)", ""):
+            continue
+        try:
+            vol = float(r["Volume"])
+            px = (float(r["High"]) + float(r["Low"]) + float(r["Last"])) / 3
+        except (KeyError, TypeError, ValueError):
+            continue                                    # 沒成交的列,價格欄是 '-'
+        if vol <= 0:
+            continue
+        code, sname, shares = info
+        if code in SSF_VALUE_EXCLUDE:
+            continue
+        a = agg.setdefault(code, {"name": sname, "value": 0.0, "lots": 0, "pct": None, "pct_val": -1})
+        val = vol * shares * px
+        a["value"] += val
+        a["lots"] += int(vol)
+        if r.get("TradingSession") == "一般" and val > a["pct_val"] and r.get("%", "-") not in ("", "-"):
+            a["pct"], a["pct_val"] = r["%"], val
+        dates.add(r.get("Date"))
+    if not agg:
+        return None
+    ranked = sorted(agg.items(), key=lambda kv: -kv[1]["value"])[:top_n]
+    items = [(code, name_lookup.get(code, a["name"]), a["value"] / 1e8, a["lots"], a["pct"])
+             for code, a in ranked]
+    return {"date": max(d for d in dates if d), "items": items}
+
+
 def build_holdings_vs_strongest_theme(my_holdings, momentum_lookup, theme_momentum, name_lookup=None,
                                         lag_alert_pct=15.0):
     """把「我手上的持股」跟「目前最強族群」的20日動能放在一起比,不是只列持股自己的漲跌幅——
@@ -1345,6 +1461,7 @@ def build_flow_digest():
     watchlist_margin = fetch_watchlist_margin(TW_STOCK_CODES, margin_lookup, name_lookup)
     leverage_gap = fetch_margin_leverage_gap()
     gap_fade = fetch_gap_fade_signal(TW_STOCK_CODES, name_lookup)
+    ssf_value = fetch_ssf_value_ranking(name_lookup)
 
     parts = [header, ""]
     if as_of_date and as_of_date != tw_now.strftime("%Y%m%d"):
@@ -1370,6 +1487,15 @@ def build_flow_digest():
             parts.append("流入：" + "、".join(f"{n}(+{v:.1f}億)" for n, v in sector_inflow))
         if sector_outflow:
             parts.append("流出：" + "、".join(f"{n}({v:+.1f}億)" for n, v in sector_outflow))
+        parts.append("")
+    if ssf_value:
+        d = ssf_value["date"]
+        stale = "" if d == tw_now.strftime("%Y%m%d") else "(⚠️期交所今天的資料還沒出來,這是上一個交易日的)"
+        parts.append(f"🔥 **股票期貨成交值排名({d[:4]}/{d[4:6]}/{d[6:]},依當天期貨成交金額,不含指數期貨/0050等ETF期貨/台積電;"
+                     f"標準+小型+所有月份+盤後合計){stale}**")
+        for i, (code, name, val, lots, pct) in enumerate(ssf_value["items"], 1):
+            parts.append(f"{i}. {name}({code}) {val:,.1f}億({lots:,}口,期貨漲跌{pct or '?'})")
+        parts.append("(成交值=口數×每口股數×當日均價估算,期交所未公布逐檔成交金額,跟實際值會有些微差距)")
         parts.append("")
     if theme_performance:
         parts.append("📊 **概念股族群漲跌幅(自訂分類,等權重平均,非官方/非市值加權)**")
